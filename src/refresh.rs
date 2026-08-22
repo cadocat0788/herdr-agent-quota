@@ -1,5 +1,5 @@
 use crate::cache::CacheStore;
-use crate::herdr::{current_agent_provider, list_agent_panes, publish_tokens, refresh_pane_topic};
+use crate::herdr::{current_agent_providers, list_agent_panes, publish_tokens, refresh_pane_topic};
 use crate::model::Provider;
 use crate::presentation::MetadataTokens;
 use crate::providers::{codex, grok};
@@ -36,21 +36,23 @@ fn run_internal(
 
 pub fn event() -> Result<()> {
     let event = event_json();
+    // Unknown agent kinds keep the historical fallback of refreshing every
+    // provider; multi-agent kinds (opencode) refresh all of their sources.
     let providers = event
         .as_ref()
         .and_then(find_agent)
-        .and_then(|agent| agent.parse::<Provider>().ok())
-        .map(|provider| vec![provider])
+        .and_then(Provider::providers_for_agent)
         .unwrap_or_else(|| Provider::ALL.to_vec());
     let topic_pane = event.as_ref().and_then(find_pane_id);
     run_internal(&providers, false, false, topic_pane)
 }
 
 pub fn focus() -> Result<()> {
-    let Some(provider) = current_agent_provider()? else {
+    let providers = current_agent_providers()?;
+    if providers.is_empty() {
         return Ok(());
-    };
-    run(&[provider], false, false)
+    }
+    run(&providers, false, false)
 }
 
 fn refresh_locked(
@@ -113,9 +115,13 @@ fn refresh_locked(
 fn publish(cache: &CacheStore, providers: &[Provider], topic_pane: Option<&str>) -> Result<()> {
     let mut panes = list_agent_panes().unwrap_or_default();
     if let Some(pane) = topic_pane.and_then(|pane_id| {
-        panes
-            .iter_mut()
-            .find(|pane| pane.pane_id == pane_id && providers.contains(&pane.provider))
+        panes.iter_mut().find(|pane| {
+            pane.pane_id == pane_id
+                && pane
+                    .providers
+                    .iter()
+                    .any(|provider| providers.contains(provider))
+        })
     }) {
         refresh_pane_topic(pane);
     }

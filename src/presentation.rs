@@ -15,22 +15,27 @@ pub struct MetadataTokens {
     pub quota_week_severity: Option<Severity>,
     pub quota_summary: String,
     pub quota_error: Option<String>,
+    // Overall snapshot severity, so a pane fed by several providers can pick
+    // which one owns its shared identity slots.
+    pub severity: Severity,
 }
 
 impl MetadataTokens {
     pub fn from_snapshot(snapshot: &ProviderSnapshot, now_unix: u64) -> Self {
+        let severity = snapshot.severity(now_unix);
         Self {
             quota_badge: snapshot.provider.badge().to_string(),
-            quota_state: snapshot.severity(now_unix).symbol().to_string(),
+            quota_state: severity.symbol().to_string(),
             quota_icon: snapshot.provider.icon().to_string(),
             quota_provider: snapshot.provider.display_name().to_string(),
-            quota_status: snapshot.severity(now_unix).label().to_string(),
+            quota_status: severity.label().to_string(),
             quota_5h: sidebar_window(snapshot, WindowKind::FiveHour, now_unix),
             quota_5h_severity: window_severity(snapshot, WindowKind::FiveHour, now_unix),
             quota_week: sidebar_window(snapshot, WindowKind::Weekly, now_unix),
             quota_week_severity: window_severity(snapshot, WindowKind::Weekly, now_unix),
             quota_summary: sidebar_summary(snapshot, now_unix),
             quota_error: None,
+            severity,
         }
     }
 
@@ -53,6 +58,7 @@ impl MetadataTokens {
             quota_week_severity: Some(Severity::Unknown),
             quota_summary: "unavailable".to_string(),
             quota_error: Some(reason.into().chars().take(80).collect()),
+            severity: Severity::Unknown,
         }
     }
 }

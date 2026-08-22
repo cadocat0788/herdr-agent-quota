@@ -178,8 +178,11 @@ fn claude_cache_is_published_by_refresh_event() {
     run_claude_refresh(state.path(), &herdr_stub);
     let report = fs::read_to_string(herdr_log).unwrap();
     assert!(!report.contains("pane read"));
+    // Single-provider panes publish bare values; the kind prefix only ever
+    // appears on multi-provider cards.
     assert!(report.contains("quota_5h=5h 42% reset"));
     assert!(report.contains("quota_week=week 73% reset"));
+    assert!(!report.contains("quota_week=claude"));
 }
 
 #[test]
@@ -321,4 +324,118 @@ fn claude_collector_does_not_republish_unchanged_quota() {
 
     run_claude_refresh(state.path(), &herdr_stub);
     assert!(!herdr_log.exists());
+}
+
+fn seed_weekly_snapshot(state: &Path, source: &str, provider: &str, remaining_percent: f64) {
+    let payload = format!(
+        r#"{{"provider":"{provider}","source":"{source}","fetched_at_unix":1750000000,"windows":[{{"kind":"weekly","used_percent":{used},"remaining_percent":{remaining},"resets_at":4102444800}}]}}"#,
+        used = 100.0 - remaining_percent,
+        remaining = remaining_percent,
+    );
+    fs::write(state.join(format!("{source}.json")), payload).unwrap();
+}
+
+#[test]
+fn opencode_event_publishes_both_subscription_windows_without_reading_the_pane() {
+    let state = tempdir().unwrap();
+    let log = state.path().join("herdr.log");
+    let herdr = state.path().join("herdr");
+    fs::write(
+        &herdr,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
+            log.display(),
+            r#"{"result":{"agents":[{"agent":"opencode","pane_id":"w1:p9"}]}}"#,
+            r#"{"result":{"pane":{"scroll":{"offset_from_bottom":0}}}}"#,
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&herdr, permissions).unwrap();
+
+    seed_weekly_snapshot(state.path(), "codex-app-server", "codex", 75.0);
+    seed_weekly_snapshot(state.path(), "grok-cli-billing", "grok", 40.0);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("event")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", state.path().join("missing-codex"))
+        .env("GROK_HOME", state.path().join("missing-grok-home"))
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":{"type":"pane_agent_detected","pane":{"agent":"opencode","pane_id":"w1:p9"}}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains("agent list"));
+    // Multi-agent cards mix prompt styles, so no pane is ever read for them.
+    assert!(!calls.contains("pane read"));
+    assert!(calls.contains("pane report-metadata w1:p9"));
+    // Codex owns the weekly group; Grok reuses the five-hour slots for its
+    // weekly window. Each value names its provider so the shared card's rows
+    // are distinguishable.
+    assert!(calls.contains("--token quota_week=codex week 75% reset "));
+    assert!(calls.contains("--token quota_5h=grok week 40% reset "));
+    // Both runways are far from their reset, so both windows warn; the shared
+    // identity stays Codex because equal severities prefer it.
+    assert!(calls.contains("--token quota_week_warning=codex week 75%"));
+    assert!(calls.contains("--token quota_5h_warning=grok week 40%"));
+    assert!(calls.contains("--token quota_provider=Codex"));
+    assert!(calls.contains("--token quota_badge=[C]"));
+}
+
+#[test]
+fn configure_writes_and_removes_a_managed_opencode_sidebar_entry() {
+    let state = tempdir().unwrap();
+    let config = state.path().join("config.toml");
+    let claude_settings = state.path().join("claude-settings.json");
+    let agy_settings = state.path().join("agy-settings.json");
+    // Keep every collector's settings inside the tempdir; configure --apply
+    // installs statusline hooks and Grok refresh hooks beyond Herdr's config.
+    let isolated = |command: &mut Command| {
+        command
+            .env("HERDR_PLUGIN_STATE_DIR", state.path())
+            .env("HERDR_CONFIG_FILE", &config)
+            .env("CLAUDE_SETTINGS_FILE", &claude_settings)
+            .env("AGY_SETTINGS_FILE", &agy_settings)
+            .env("GROK_HOME", state.path().join("grok"));
+    };
+
+    fs::write(
+        &config,
+        "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]\n",
+    )
+    .unwrap();
+
+    let mut applied = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+    isolated(&mut applied);
+    let applied = applied.arg("configure").arg("--apply").output().unwrap();
+    assert!(applied.status.success());
+    let content = fs::read_to_string(&config).unwrap();
+    assert!(content.contains("[ui.sidebar.agents.rows_by_agent]"));
+    assert!(content.contains("opencode = [["));
+    assert!(content.contains("#7a9e7e"));
+    assert_eq!(
+        add_quota_row(&content).unwrap(),
+        content,
+        "applying again must be idempotent"
+    );
+
+    let mut removed = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+    isolated(&mut removed);
+    let removed = removed
+        .arg("configure")
+        .arg("--uninstall")
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    let restored = fs::read_to_string(&config).unwrap();
+    assert!(!restored.contains("opencode = [["));
+    // apply normalizes the official row, mapping workspace back to tab.
+    assert!(restored.contains("[[\"state_icon\", \"tab\"]]"));
 }

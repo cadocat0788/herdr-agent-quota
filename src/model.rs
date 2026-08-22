@@ -51,18 +51,47 @@ impl Provider {
             Self::Agy => "agy-statusline",
         }
     }
+
+    /// Lowercase Herdr agent-kind name for this data source, used to label
+    /// window rows on cards fed by several providers.
+    pub fn agent_kind(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Claude => "claude",
+            Self::Agy => "agy",
+        }
+    }
+}
+
+impl Provider {
+    /// Single mapping from Herdr's agent kind to the data sources that feed
+    /// one of its cards. Most kinds map to exactly one provider; an agent
+    /// kind like `opencode` runs several agents, so its card is fed by every
+    /// subscription those agents consume.
+    pub fn providers_for_agent(kind: &str) -> Option<Vec<Self>> {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some(vec![Self::Codex]),
+            "grok" => Some(vec![Self::Grok]),
+            "claude" | "claude-code" | "anthropic" => Some(vec![Self::Claude]),
+            "agy" | "antigravity" | "antigravity-cli" => Some(vec![Self::Agy]),
+            "opencode" => Some(vec![Self::Codex, Self::Grok]),
+            _ => None,
+        }
+    }
 }
 
 impl std::str::FromStr for Provider {
     type Err = ModelError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "codex" => Ok(Self::Codex),
-            "grok" => Ok(Self::Grok),
-            "claude" | "claude-code" | "anthropic" => Ok(Self::Claude),
-            "agy" | "antigravity" | "antigravity-cli" => Ok(Self::Agy),
-            other => Err(ModelError::UnknownProvider(other.to_string())),
+        // Only 1:1 kinds name a single provider identity; multi-provider
+        // kinds (opencode) deliberately fail to parse as a lone Provider.
+        match Self::providers_for_agent(value).as_deref() {
+            Some([provider]) => Ok(*provider),
+            _ => Err(ModelError::UnknownProvider(
+                value.trim().to_ascii_lowercase(),
+            )),
         }
     }
 }
@@ -334,5 +363,47 @@ mod tests {
         assert_eq!(Provider::Grok.badge(), "[X]");
         assert_eq!(Provider::Codex.icon(), "◈C");
         assert_eq!(Provider::Claude.icon(), "✦Cl");
+    }
+
+    #[test]
+    fn opencode_maps_to_codex_and_grok_subscription_quota() {
+        assert_eq!(
+            Provider::providers_for_agent("opencode"),
+            Some(vec![Provider::Codex, Provider::Grok])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("  OpenCode\t"),
+            Some(vec![Provider::Codex, Provider::Grok])
+        );
+    }
+
+    #[test]
+    fn one_to_one_agent_kinds_keep_their_single_provider() {
+        assert_eq!(
+            Provider::providers_for_agent("claude"),
+            Some(vec![Provider::Claude])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("claude-code"),
+            Some(vec![Provider::Claude])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("ANTIGRAVITY-CLI"),
+            Some(vec![Provider::Agy])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("codex"),
+            Some(vec![Provider::Codex])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("grok"),
+            Some(vec![Provider::Grok])
+        );
+        assert_eq!(Provider::providers_for_agent("gemini"), None);
+    }
+
+    #[test]
+    fn multi_provider_kinds_have_no_single_provider_identity() {
+        assert!("opencode".parse::<Provider>().is_err());
     }
 }
