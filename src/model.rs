@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -224,11 +225,174 @@ impl UsageWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub used_percent: f64,
+    #[serde(default)]
+    pub cache: Option<CacheUsage>,
+}
+
+impl ContextUsage {
+    pub fn new(used_percent: f64) -> Result<Self, ModelError> {
+        if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) {
+            return Err(ModelError::InvalidPercentage(used_percent));
+        }
+        Ok(Self {
+            used_percent,
+            cache: None,
+        })
+    }
+
+    pub fn with_cache(mut self, cache: Option<CacheUsage>) -> Self {
+        self.cache = cache;
+        self
+    }
+}
+
+/// Cache counters reported for the latest provider request.
+///
+/// The provider statusLine payloads expose uncached input, cache creation, and
+/// cache reads. Keeping the raw counters alongside the derived percentage
+/// makes the displayed ratio auditable and leaves room for richer diagnostics
+/// without another provider request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheUsage {
+    pub fresh_input_tokens: u64,
+    pub read_tokens: u64,
+    pub creation_tokens: u64,
+    pub hit_percent: f64,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub last_activity_unix: Option<u64>,
+    /// Cumulative cache counters for the current provider session.
+    ///
+    /// `current_usage` is a latest-request view for Claude/Agy, so the
+    /// sidebar uses this optional aggregate when a local transcript gives us
+    /// a trustworthy session boundary and offset.
+    #[serde(default)]
+    pub session_totals: Option<CacheTotals>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub transcript_offset: u64,
+}
+
+/// Cache counters accumulated across all completed requests in one session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheTotals {
+    pub fresh_input_tokens: u64,
+    pub read_tokens: u64,
+    pub creation_tokens: u64,
+    pub hit_percent: f64,
+}
+
+impl CacheTotals {
+    pub fn from_token_counts(
+        fresh_input_tokens: u64,
+        read_tokens: u64,
+        creation_tokens: u64,
+    ) -> Option<Self> {
+        let total = fresh_input_tokens
+            .saturating_add(read_tokens)
+            .saturating_add(creation_tokens);
+        if total == 0 {
+            return None;
+        }
+        Some(Self {
+            fresh_input_tokens,
+            read_tokens,
+            creation_tokens,
+            hit_percent: read_tokens as f64 / total as f64 * 100.0,
+        })
+    }
+
+    pub fn add_token_counts(
+        &mut self,
+        fresh_input_tokens: u64,
+        read_tokens: u64,
+        creation_tokens: u64,
+    ) {
+        self.fresh_input_tokens = self.fresh_input_tokens.saturating_add(fresh_input_tokens);
+        self.read_tokens = self.read_tokens.saturating_add(read_tokens);
+        self.creation_tokens = self.creation_tokens.saturating_add(creation_tokens);
+        let total = self
+            .fresh_input_tokens
+            .saturating_add(self.read_tokens)
+            .saturating_add(self.creation_tokens);
+        self.hit_percent = if total == 0 {
+            0.0
+        } else {
+            self.read_tokens as f64 / total as f64 * 100.0
+        };
+    }
+}
+
+impl CacheUsage {
+    pub fn from_token_counts(
+        fresh_input_tokens: u64,
+        read_tokens: u64,
+        creation_tokens: u64,
+    ) -> Option<Self> {
+        let total = fresh_input_tokens
+            .saturating_add(read_tokens)
+            .saturating_add(creation_tokens);
+        if total == 0 {
+            return None;
+        }
+        Some(Self {
+            fresh_input_tokens,
+            read_tokens,
+            creation_tokens,
+            hit_percent: read_tokens as f64 / total as f64 * 100.0,
+            ttl_seconds: None,
+            last_activity_unix: None,
+            session_totals: None,
+            session_id: None,
+            transcript_offset: 0,
+        })
+    }
+
+    pub fn with_ttl_estimate(mut self, ttl_seconds: u64, last_activity_unix: u64) -> Self {
+        self.ttl_seconds = Some(ttl_seconds);
+        self.last_activity_unix = Some(last_activity_unix);
+        self
+    }
+
+    pub fn remaining_ttl_seconds(&self, now_unix: u64) -> Option<u64> {
+        let ttl = self.ttl_seconds?;
+        let last_activity = self.last_activity_unix?;
+        Some(last_activity.saturating_add(ttl).saturating_sub(now_unix))
+    }
+
+    pub fn with_session_totals(
+        mut self,
+        totals: Option<CacheTotals>,
+        session_id: impl Into<String>,
+        transcript_offset: u64,
+    ) -> Self {
+        self.session_totals = totals;
+        self.session_id = Some(session_id.into());
+        self.transcript_offset = transcript_offset;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshot {
     pub provider: Provider,
     pub source: String,
     pub fetched_at_unix: u64,
     pub windows: Vec<UsageWindow>,
+    #[serde(default)]
+    pub context: Option<ContextUsage>,
+    #[serde(default)]
+    pub session_summaries: BTreeMap<String, String>,
+    /// Login identity the snapshot was fetched for (Grok `user_id`, Codex
+    /// `tokens.account_id`). Used to drop another account's cached quota after
+    /// `grok login` / Codex account switch. Absent on snapshots written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl ProviderSnapshot {
@@ -238,6 +402,41 @@ impl ProviderSnapshot {
             source: provider.source().to_string(),
             fetched_at_unix,
             windows,
+            context: None,
+            session_summaries: BTreeMap::new(),
+            account_id: None,
+        }
+    }
+
+    pub fn with_context(mut self, context: Option<ContextUsage>) -> Self {
+        self.context = context;
+        self
+    }
+
+    pub fn with_account_id(mut self, account_id: Option<String>) -> Self {
+        self.account_id = account_id;
+        self
+    }
+
+    /// Whether this cached snapshot still belongs to the signed-in account.
+    ///
+    /// A failed refresh must keep the last good value for the *current*
+    /// account, not a previous login. After an account switch:
+    /// - snapshots stamped with another `account_id` are unusable;
+    /// - legacy snapshots (no stamp) are unusable when the credential file is
+    ///   newer than `fetched_at_unix`, which is what `grok login` does.
+    pub fn usable_for_account(
+        &self,
+        current_account_id: Option<&str>,
+        credentials_mtime_unix: Option<u64>,
+    ) -> bool {
+        match (self.account_id.as_deref(), current_account_id) {
+            (Some(saved), Some(current)) => saved == current,
+            (Some(_), None) => false,
+            (None, Some(_)) => {
+                credentials_mtime_unix.is_none_or(|mtime| mtime <= self.fetched_at_unix)
+            }
+            (None, None) => true,
         }
     }
 
@@ -345,6 +544,70 @@ mod tests {
         let value = window(WindowKind::Weekly, 42.5);
         assert_eq!(value.remaining_percent, 57.5);
         assert_eq!(format_percent(value.remaining_percent), "58");
+    }
+
+    #[test]
+    fn cache_hit_ratio_uses_fresh_creation_and_read_tokens() {
+        let cache = CacheUsage::from_token_counts(100, 800, 100).unwrap();
+        assert_eq!(cache.hit_percent, 80.0);
+        assert_eq!(CacheUsage::from_token_counts(0, 0, 0), None);
+        assert_eq!(
+            CacheUsage::from_token_counts(100, 0, 0)
+                .unwrap()
+                .hit_percent,
+            0.0
+        );
+    }
+
+    #[test]
+    fn session_cache_totals_accumulate_and_recompute_hit_ratio() {
+        let mut totals = CacheTotals::from_token_counts(100, 800, 100).unwrap();
+        totals.add_token_counts(100, 0, 0);
+        assert_eq!(totals.fresh_input_tokens, 200);
+        assert_eq!(totals.read_tokens, 800);
+        assert_eq!(totals.creation_tokens, 100);
+        assert_eq!(totals.hit_percent, 72.72727272727273);
+    }
+
+    #[test]
+    fn old_context_snapshots_deserialize_without_cache_fields() {
+        let context: ContextUsage = serde_json::from_str(r#"{"used_percent":23.5}"#).unwrap();
+        assert_eq!(context.used_percent, 23.5);
+        assert!(context.cache.is_none());
+    }
+
+    #[test]
+    fn cached_snapshot_from_another_account_is_not_usable() {
+        let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 100)
+            .with_account_id(Some("account-a".to_string()));
+        assert!(!snapshot.usable_for_account(Some("account-b"), Some(50)));
+        assert!(snapshot.usable_for_account(Some("account-a"), Some(200)));
+    }
+
+    #[test]
+    fn legacy_snapshot_is_dropped_when_credentials_are_newer_than_the_fetch() {
+        let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 100);
+        assert!(!snapshot.usable_for_account(Some("account-b"), Some(150)));
+        assert!(snapshot.usable_for_account(Some("account-b"), Some(100)));
+        assert!(snapshot.usable_for_account(Some("account-b"), Some(50)));
+    }
+
+    #[test]
+    fn old_snapshots_deserialize_without_account_id() {
+        let snapshot: ProviderSnapshot = serde_json::from_str(
+            r#"{"provider":"grok","source":"grok-cli-billing","fetched_at_unix":1,"windows":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.account_id, None);
+    }
+
+    #[test]
+    fn approximate_cache_ttl_saturates_after_expiry() {
+        let cache = CacheUsage::from_token_counts(1, 1, 0)
+            .unwrap()
+            .with_ttl_estimate(300, 1_000);
+        assert_eq!(cache.remaining_ttl_seconds(1_100), Some(200));
+        assert_eq!(cache.remaining_ttl_seconds(1_301), Some(0));
     }
 
     #[test]

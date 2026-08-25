@@ -22,6 +22,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Keep selected working providers' quotas fresh with one global poller.
+    /// This is started automatically by the Herdr status event hook.
+    Watch {
+        #[arg(long, default_value = "all")]
+        provider: ProviderSelection,
+        /// Override the configured poll interval for this run.
+        #[arg(long)]
+        interval_seconds: Option<u64>,
+    },
     Event,
     Focus,
     Dashboard,
@@ -33,6 +42,9 @@ pub enum Command {
         apply: bool,
         #[arg(long, conflicts_with_all = ["check", "apply"])]
         uninstall: bool,
+        /// Persist the active-turn poll interval while applying configuration.
+        #[arg(long, requires = "apply")]
+        watch_interval_seconds: Option<u64>,
     },
     ClaudeStatusline,
     AgyStatusline,

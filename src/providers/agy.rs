@@ -1,5 +1,6 @@
 use crate::cache::CacheStore;
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
+use crate::providers::statusline::parse_context;
 use crate::providers::ProviderError;
 use serde_json::Value;
 
@@ -33,11 +34,16 @@ pub fn parse_statusline(
             "quota has no supported windows".to_string(),
         ));
     }
-    Ok(ProviderSnapshot::new(
-        Provider::Agy,
-        windows,
-        fetched_at_unix,
-    ))
+    Ok(
+        ProviderSnapshot::new(Provider::Agy, windows, fetched_at_unix).with_context(
+            parse_context(
+                value
+                    .get("context_window")
+                    .or_else(|| value.get("contextWindow")),
+            )
+            .unwrap_or(None),
+        ),
+    )
 }
 
 fn parse_window(
@@ -126,6 +132,42 @@ mod tests {
         assert_eq!(
             snapshot.window(WindowKind::FiveHour).unwrap().resets_at,
             Some(ResetAt::from_unix_seconds(1_786_798_800))
+        );
+    }
+
+    #[test]
+    fn parses_optional_context_window_usage() {
+        let value = json!({
+            "context_window": {
+                "used_percentage": 41.0,
+                "current_usage": {
+                    "input_tokens": 50,
+                    "cache_read_input_tokens": 150,
+                    "cache_creation_input_tokens": 0
+                }
+            },
+            "quota": {
+                "gemini-weekly": {"remaining_fraction": 0.8}
+            }
+        });
+        let snapshot = parse_statusline(&value, 1).unwrap();
+        assert_eq!(
+            snapshot
+                .context
+                .as_ref()
+                .map(|context| context.used_percent),
+            Some(41.0)
+        );
+        assert_eq!(
+            snapshot
+                .context
+                .as_ref()
+                .unwrap()
+                .cache
+                .as_ref()
+                .unwrap()
+                .hit_percent,
+            75.0
         );
     }
 

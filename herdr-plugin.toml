@@ -2,7 +2,7 @@ id = "herdr-agent-quota"
 name = "Herdr Agent Quota"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Never hit a quota limit mid-task: see Claude, Codex, Grok and Agy usage live in your Herdr sidebar. 5h and weekly percent remaining, updated on every agent event."
+description = "Never hit a quota limit mid-task: see Claude, Codex, Grok and Agy usage live in your Herdr sidebar. Quota windows, supported context usage, and session summaries refresh throughout active turns."
 platforms = ["macos", "linux"]
 
 [[build]]

@@ -58,6 +58,53 @@ fn old_plugin_wrappers_are_repaired_without_becoming_the_backup() {
 }
 
 #[test]
+fn claude_statusline_refreshes_rate_limits_with_the_configured_interval() {
+    let directory = tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let state = directory.path().join("state");
+    let executable = directory.path().join("herdr-agent-quota");
+    fs::write(
+        &settings,
+        r#"{"statusLine":{"type":"command","command":"echo old"}}"#,
+    )
+    .unwrap();
+
+    claude::apply_at(&settings, &state, &executable).unwrap();
+    let installed: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(installed["statusLine"]["refreshInterval"], 60);
+
+    claude::apply_at_with_refresh_interval(&settings, &state, &executable, 300).unwrap();
+    let customized: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(customized["statusLine"]["refreshInterval"], 300);
+
+    claude::uninstall_at(&settings, &state).unwrap();
+    let restored: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(restored["statusLine"]["command"], "echo old");
+    assert!(restored["statusLine"].get("refreshInterval").is_none());
+}
+
+#[test]
+fn claude_preserves_a_user_owned_refresh_interval_on_first_install() {
+    let directory = tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let state = directory.path().join("state");
+    let executable = directory.path().join("herdr-agent-quota");
+    fs::write(
+        &settings,
+        r#"{"statusLine":{"type":"command","command":"echo old","refreshInterval":15}}"#,
+    )
+    .unwrap();
+
+    claude::apply_at(&settings, &state, &executable).unwrap();
+    let installed: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(installed["statusLine"]["refreshInterval"], 15);
+
+    claude::uninstall_at(&settings, &state).unwrap();
+    let restored: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(restored["statusLine"]["refreshInterval"], 15);
+}
+
+#[test]
 fn repair_migrates_a_previous_backup_from_the_old_state_directory() {
     let directory = tempdir().unwrap();
     let settings = directory.path().join("settings.json");

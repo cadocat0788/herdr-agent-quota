@@ -9,16 +9,38 @@ This plugin's whole job is to put quota numbers in Herdr's sidebar. Every
 Herdr call it makes to do that lands on a pane that a human is actively
 watching. Two calls are visible to the user:
 
-- `herdr pane read <id>` — makes Herdr repaint that pane. The agent's TUI
-  redraws its whole frame, which the user sees as the terminal scrolling up
-  and then snapping back to the bottom.
-- `herdr pane report-metadata <id>` — same repaint risk when the tokens
-  actually change.
+- `herdr pane read <id> --source recent` (and `recent-unwrapped`) — rebuilds the
+  pane's wrapped scrollback. Measured at **4.45s per call** against 0.006s for
+  `--source visible`, and it repaints the pane: the agent's TUI redraws its whole
+  frame, which the user sees as the terminal scrolling up and snapping back to
+  the bottom. **One read, one scroll** — confirmed 1:1 by burst-reading a live
+  pane while the user watched (2 `recent` reads → 2 scrolls; 13 `visible` reads
+  → none).
+- `herdr pane report-metadata <id>` — repaint risk when the tokens actually
+  change, though it was never reproduced as a scroll on its own.
 
-Neither is detectable from `pane get`: `offset_from_bottom` and
+Use `--source visible` (or `detection`; both return the current screen). The
+prompt is on screen at the moment `idle->working` fires, which is exactly when
+the topic changes. Later in the turn it may have scrolled off — then extraction
+returns `None` and the caller must keep the topic it already published.
+
+| `--source` | cost | repaints |
+|---|---|---|
+| `visible` | 0.006s | no |
+| `detection` | 0.004s | no |
+| `recent` | 4.452s | **yes** |
+| `recent-unwrapped` | 4.448s | **yes** |
+
+None of this is detectable from `pane get`: `offset_from_bottom` and
 `max_offset_from_bottom` stay `0` throughout, because full-screen agent TUIs
 have no Herdr scrollback. The viewport never moves. What moves is the agent's
 own repaint. **Do not conclude "no scroll happened" from the scroll offsets.**
+
+Comparing a pane's content hash before and after a call does not work either:
+the repaint ends with the pane back exactly as it was, so the hashes match and
+the scroll is invisible to sampling. This produced a false "pane read is
+harmless" result during diagnosis. **A human has to watch the pane.** The only
+reliable instrument is a burst of N calls with the user counting scrolls.
 
 Concretely, this means:
 
@@ -39,13 +61,20 @@ Concretely, this means:
 
 | Entry point | Fired by | Allowed to read panes? |
 |---|---|---|
-| `refresh` | startup, manual action, Grok hooks | No |
+| `refresh` | startup, manual action | No |
 | `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON` |
 | `focus` | `pane.focused` | No |
+| `watch` | detached from a working status event | No (agent metadata only) |
 
 `pane.agent_status_changed` fires **twice per turn** (idle→working on submit,
 working→idle on completion). Anything `event` does, the user pays for twice
 every time they press Enter. Budget accordingly.
+
+The working event starts one global `watch` pulse. It calls `herdr agent list`
+once per configured interval, refreshes every working provider in that pass,
+publishes without reading pane output, and exits after all agents settle. The
+interval defaults to 60 seconds and is bounded to 30 seconds–1 hour. Uninstall
+writes a stop marker so a detached watcher cannot survive a restore.
 
 ## Event payload shapes
 

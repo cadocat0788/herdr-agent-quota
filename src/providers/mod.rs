@@ -3,6 +3,7 @@ pub mod claude;
 pub mod codex;
 pub mod grok;
 pub mod opencode_go;
+pub mod statusline;
 
 use thiserror::Error;
 

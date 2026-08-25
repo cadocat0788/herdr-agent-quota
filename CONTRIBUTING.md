@@ -12,8 +12,7 @@ for you) and Herdr `0.8.0+`.
 ```sh
 git clone https://github.com/levi-qiao/herdr-agent-quota
 cd herdr-agent-quota
-cargo build --release
-herdr plugin link .
+./install.sh
 ```
 
 ## Before opening a pull request
@@ -41,8 +40,11 @@ needs to say so explicitly in the pull request.
 4. **Every user-facing config edit is reversible.** `configure --apply` backs up
    what it replaces and `configure --uninstall` restores it. Both are
    idempotent.
-5. **No resident processes.** The statusLine hooks are one-shot, and the Codex
-   app-server subprocess is killed and reaped before the command returns.
+5. **No permanent resident processes.** StatusLine hooks are one-shot, the
+   Codex app-server subprocess is killed and reaped before the command returns,
+   and the active-turn refresh watcher is one bounded global worker. It polls
+   once per configured interval, exits when all turns settle, and has a safety
+   cap.
 
 ## Adding a provider
 

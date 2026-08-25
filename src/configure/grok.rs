@@ -1,6 +1,5 @@
 use crate::cache::CacheStore;
 use anyhow::{Context, Result};
-use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,10 +10,13 @@ const MANAGED_BY: &str = "herdr-agent-quota";
 pub fn check() -> Result<()> {
     let path = hook_path()?;
     if is_managed_hook(&path) {
-        println!("Grok quota hook is already installed: {}", path.display());
+        println!(
+            "Legacy Grok quota hook will be removed; the unified active-turn watcher handles refreshes: {}",
+            path.display()
+        );
     } else {
         println!(
-            "Grok quota hook preview for {}: refresh during active turns and after final replies",
+            "No Grok response hook is needed; the unified active-turn watcher handles {}",
             path.display()
         );
     }
@@ -31,30 +33,13 @@ pub fn uninstall() -> Result<()> {
     uninstall_at(&hook_path()?)
 }
 
-pub fn apply_at(path: &Path, state: &Path, executable: &Path) -> Result<()> {
-    let desired = hook_document(state, executable);
-    if path.exists() {
-        let current = fs::read_to_string(path).context("read Grok quota hook")?;
-        if current == desired {
-            return Ok(());
-        }
-        if !current.contains(LEGACY_REFRESH_ACTION) && !current.contains(MANAGED_BY) {
-            anyhow::bail!(
-                "refusing to replace user-owned Grok hook file {}",
-                path.display()
-            );
-        }
+pub fn apply_at(path: &Path, _state: &Path, _executable: &Path) -> Result<()> {
+    // The unified watcher replaces the old per-tool Grok hook. Only remove a
+    // file that this plugin owns; a user's unrelated hook is never touched.
+    if is_managed_hook(path) {
+        fs::remove_file(path).context("remove legacy Grok quota hook")?;
+        println!("Removed legacy Grok quota hook from {}", path.display());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("create Grok hooks directory")?;
-    }
-    let temporary = path.with_extension("json.herdr-agent-quota.tmp");
-    fs::write(&temporary, desired).context("write Grok quota hook")?;
-    fs::rename(&temporary, path).context("replace Grok quota hook")?;
-    println!(
-        "Installed silent Grok active-response refresh hook at {}",
-        path.display()
-    );
     Ok(())
 }
 
@@ -79,34 +64,4 @@ fn is_managed_hook(path: &Path) -> bool {
         contents.contains(LEGACY_REFRESH_ACTION)
             || (contents.contains(MANAGED_BY) && contents.contains("refresh --provider grok"))
     })
-}
-
-fn hook_document(state: &Path, executable: &Path) -> String {
-    let command = format!(
-        "HERDR_PLUGIN_STATE_DIR={} {} refresh --provider grok >/dev/null 2>&1",
-        shell_quote(state),
-        shell_quote(executable)
-    );
-    let handler = json!({
-        "hooks": [{
-            "type": "command",
-            "command": command,
-            "timeout": 3
-        }]
-    });
-    serde_json::to_string_pretty(&json!({
-        "hooks": {
-            "PostToolUse": [handler.clone()],
-            "Stop": [handler.clone()],
-            "StopFailure": [handler.clone()],
-            "StopCancelled": [handler]
-        },
-        "managedBy": MANAGED_BY
-    }))
-    .expect("serialize static Grok hook")
-        + "\n"
-}
-
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

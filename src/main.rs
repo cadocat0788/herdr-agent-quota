@@ -10,6 +10,10 @@ fn main() -> Result<()> {
             force,
             json,
         } => herdr_agent_quota::refresh::run(&provider.providers(), force, json),
+        Command::Watch {
+            provider,
+            interval_seconds,
+        } => herdr_agent_quota::refresh::watch(&provider.providers(), interval_seconds),
         Command::Event => herdr_agent_quota::refresh::event(),
         Command::Focus => herdr_agent_quota::refresh::focus(),
         Command::Dashboard => herdr_agent_quota::dashboard::run(),
@@ -18,7 +22,8 @@ fn main() -> Result<()> {
             check,
             apply,
             uninstall,
-        } => herdr_agent_quota::configure::run(check, apply, uninstall),
+            watch_interval_seconds,
+        } => herdr_agent_quota::configure::run(check, apply, uninstall, watch_interval_seconds),
         Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),
         Command::AgyStatusline => herdr_agent_quota::configure::agy::run_statusline_hook(),
     }

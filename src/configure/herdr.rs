@@ -1,15 +1,20 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 18] = [
+const QUOTA_ROW_MARKERS: [&str; 23] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
     "$quota_provider",
     "$quota_status",
     "$quota_summary",
+    "$quota_session",
+    "$quota_context",
+    "$quota_cache",
+    "$quota_cache_ttl",
+    "$quota_error",
     "$quota_topic",
     "$quota_5h",
     "$quota_week",
@@ -27,9 +32,13 @@ const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const PROVIDER_STYLE_MARKER: &str = "herdr-agent-quota-provider";
 const REFRESH_KEY: &str = "prefix+shift+r";
 const REFRESH_ACTION: &str = "herdr-agent-quota.refresh";
+const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 const QUOTA_SAFE_COLOR: &str = "#84b084";
 const QUOTA_WARNING_COLOR: &str = "#cdaa65";
 const QUOTA_DANGER_COLOR: &str = "#ca6470";
+const CONTEXT_COLOR: &str = "#9b8fd8";
+const CACHE_COLOR: &str = "#6fb5b7";
+const CACHE_TTL_COLOR: &str = "#cdaa65";
 // `opencode` is a pane kind, not a data source, and deliberately gets no new
 // metadata token names: its card reuses the existing $quota_* slots, which
 // keeps the token diff-gate in src/herdr.rs untouched.
@@ -59,20 +68,14 @@ pub fn check() -> Result<()> {
 
 pub fn apply() -> Result<()> {
     let path = config_path()?;
+    let existed = path.exists();
     let original = fs::read_to_string(&path).unwrap_or_default();
     let updated = add_quota_row(&original)?;
     if updated == original {
         return Ok(());
     }
-    if !original.is_empty() {
-        if let Some(backup) = backup_path()? {
-            if let Some(parent) = backup.parent() {
-                fs::create_dir_all(parent).context("create plugin state directory")?;
-            }
-            if !backup.exists() {
-                fs::write(backup, &original).context("write Herdr config backup")?;
-            }
-        }
+    if let Some(backup) = backup_path()? {
+        write_backup(&backup, &original, existed)?;
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create Herdr config directory")?;
@@ -84,18 +87,31 @@ pub fn apply() -> Result<()> {
 
 pub fn uninstall() -> Result<()> {
     let path = config_path()?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let original = fs::read_to_string(&path).context("read Herdr config")?;
-    let updated = remove_quota_row(&original)?;
-    if updated != original {
-        fs::write(&path, updated).context("remove quota sidebar row")?;
-        println!("Removed quota sidebar row from {}", path.display());
+    if path.exists() {
+        let original = fs::read_to_string(&path).context("read Herdr config")?;
+        let updated = reversible_backup(&original)?.unwrap_or(remove_quota_row(&original)?);
+        let originally_absent = backup_presence_path()?
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|value| value.trim() == "absent");
+        if originally_absent && updated.is_empty() {
+            fs::remove_file(&path).context("remove empty Herdr config")?;
+            println!(
+                "Removed quota sidebar configuration from {}",
+                path.display()
+            );
+        } else if updated != original {
+            fs::write(&path, updated).context("remove quota sidebar row")?;
+            println!("Removed quota sidebar row from {}", path.display());
+        }
     }
     if let Some(backup) = backup_path()? {
         if backup.exists() {
             fs::remove_file(backup).context("remove Herdr config backup")?;
+        }
+        if let Some(presence) = backup_presence_path()? {
+            if presence.exists() {
+                fs::remove_file(presence).context("remove Herdr config backup marker")?;
+            }
         }
     }
     Ok(())
@@ -112,6 +128,40 @@ pub fn config_path() -> Result<PathBuf> {
 fn backup_path() -> Result<Option<PathBuf>> {
     let state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
     Ok(state.map(|directory| PathBuf::from(directory).join("herdr-config.original.toml")))
+}
+
+fn backup_presence_path() -> Result<Option<PathBuf>> {
+    Ok(std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+        .map(PathBuf::from)
+        .map(|directory| directory.join(CONFIG_PRESENCE_FILE)))
+}
+
+fn write_backup(path: &Path, original: &str, existed: bool) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create plugin state directory")?;
+    }
+    if !path.exists() {
+        fs::write(path, original).context("write Herdr config backup")?;
+        if let Some(marker) = backup_presence_path()? {
+            fs::write(marker, if existed { "present" } else { "absent" })
+                .context("write Herdr config backup marker")?;
+        }
+    }
+    Ok(())
+}
+
+fn reversible_backup(current: &str) -> Result<Option<String>> {
+    let Some(path) = backup_path()? else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let original = fs::read_to_string(&path).context("read Herdr config backup")?;
+    if add_quota_row(&original)? == current {
+        return Ok(Some(original));
+    }
+    Ok(None)
 }
 
 pub fn add_quota_row(input: &str) -> Result<String> {
@@ -158,6 +208,9 @@ pub fn add_quota_row(input: &str) -> Result<String> {
 pub fn remove_quota_row(input: &str) -> Result<String> {
     if input.trim().is_empty() {
         return Ok(input.to_string());
+    }
+    if add_quota_row("")?.as_str() == input {
+        return Ok(String::new());
     }
     let mut document = input
         .parse::<DocumentMut>()
@@ -406,9 +459,9 @@ fn normalize_official_row(row: Array) -> Array {
 }
 
 fn append_quota_rows(rows: &mut Array) {
-    // Keep the official state row, but split each quota window onto its own
-    // row. Herdr elides rows whose custom token is absent, so weekly-only
-    // providers do not gain a blank five-hour row.
+    // Keep the official state row and put both quota windows on one compact
+    // row. Herdr elides missing tokens and their separators, so weekly-only
+    // providers do not gain a blank five-hour segment.
     for row in rows.iter_mut() {
         let Some(items) = row.as_array_mut() else {
             continue;
@@ -434,20 +487,34 @@ fn append_quota_rows(rows: &mut Array) {
     *rows = compacted_rows;
 
     let official_index = rows.iter().position(|row| {
-        row.as_array().is_some_and(|items| {
-            items.iter().any(|item| item.as_str() == Some("state_icon"))
-                && !items.iter().any(|item| item.as_str() == Some("agent"))
-        })
+        row.as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("state_icon")))
     });
 
     if let Some(index) = official_index {
         if let Some(row) = rows.get_mut(index).and_then(Value::as_array_mut) {
-            row.push(styled_token(
-                "$quota_provider",
-                None,
-                Some(true),
-                Some(false),
-            ));
+            if !row
+                .iter()
+                .any(|item| matches!(item.as_str(), Some("agent") | Some("$quota_provider")))
+            {
+                row.push(styled_token(
+                    "$quota_provider",
+                    None,
+                    Some(true),
+                    Some(false),
+                ));
+            }
+            if !row
+                .iter()
+                .any(|item| configured_token_name(item) == Some("$quota_context"))
+            {
+                row.push(styled_token(
+                    "$quota_context",
+                    Some(CONTEXT_COLOR),
+                    Some(true),
+                    Some(false),
+                ));
+            }
         }
     }
 
@@ -458,29 +525,52 @@ fn append_quota_rows(rows: &mut Array) {
         Some(false),
     )));
 
-    append_window_rows(rows, "quota_5h");
-    append_window_rows(rows, "quota_week");
+    append_cache_row(rows);
+
+    append_window_row(rows);
 }
 
-fn append_window_rows(rows: &mut Array, base: &str) {
-    rows.push(Value::Array(styled_row(
-        &format!("${base}_normal"),
-        Some(QUOTA_SAFE_COLOR),
-        Some(true),
-        Some(false),
-    )));
-    rows.push(Value::Array(styled_row(
-        &format!("${base}_warning"),
-        Some(QUOTA_WARNING_COLOR),
-        Some(true),
-        Some(false),
-    )));
-    rows.push(Value::Array(styled_row(
-        &format!("${base}_danger"),
-        Some(QUOTA_DANGER_COLOR),
-        Some(true),
-        Some(false),
-    )));
+fn append_cache_row(rows: &mut Array) {
+    rows.push(Value::Array(Array::from_iter([
+        styled_token("$quota_cache", Some(CACHE_COLOR), Some(true), Some(false)),
+        styled_token(
+            "$quota_cache_ttl",
+            Some(CACHE_TTL_COLOR),
+            Some(true),
+            Some(false),
+        ),
+        styled_token(
+            "$quota_error",
+            Some(QUOTA_DANGER_COLOR),
+            Some(true),
+            Some(false),
+        ),
+    ])));
+}
+
+fn append_window_row(rows: &mut Array) {
+    let mut row = Array::new();
+    for base in ["quota_5h", "quota_week"] {
+        row.push(styled_token(
+            &format!("${base}_normal"),
+            Some(QUOTA_SAFE_COLOR),
+            Some(true),
+            Some(false),
+        ));
+        row.push(styled_token(
+            &format!("${base}_warning"),
+            Some(QUOTA_WARNING_COLOR),
+            Some(true),
+            Some(false),
+        ));
+        row.push(styled_token(
+            &format!("${base}_danger"),
+            Some(QUOTA_DANGER_COLOR),
+            Some(true),
+            Some(false),
+        ));
+    }
+    rows.push(Value::Array(row));
 }
 
 fn styled_row(token: &str, fg: Option<&str>, bold: Option<bool>, dim: Option<bool>) -> Array {
@@ -506,7 +596,7 @@ fn styled_token(token: &str, fg: Option<&str>, bold: Option<bool>, dim: Option<b
 
 fn print_diff_hint() {
     println!("  keep Herdr's official state icon and plane tab");
-    println!("  show the user prompt before separate, severity-colored 5h/week rows");
+    println!("  show the user prompt before one compact, severity-colored 5h/7d row");
 }
 
 #[cfg(test)]
@@ -527,6 +617,61 @@ rows = [["state_icon", "agent"]]
         assert!(updated.contains("$quota_5h_warning"));
         assert!(updated.contains("$quota_week_danger"));
         assert_eq!(add_quota_row(&updated).unwrap(), updated);
+    }
+
+    #[test]
+    fn puts_both_quota_windows_on_one_color_preserving_row() {
+        let updated =
+            add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
+        let document = updated.parse::<DocumentMut>().unwrap();
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        assert!(rows.iter().any(|row| {
+            let items = row.as_array().unwrap();
+            items
+                .iter()
+                .any(|item| configured_token_name(item) == Some("$quota_5h_normal"))
+                && items
+                    .iter()
+                    .any(|item| configured_token_name(item) == Some("$quota_week_normal"))
+        }));
+    }
+
+    #[test]
+    fn puts_cache_rate_and_remaining_ttl_on_one_row() {
+        let updated =
+            add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
+        let document = updated.parse::<DocumentMut>().unwrap();
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        assert!(rows.iter().any(|row| {
+            let items = row.as_array().unwrap();
+            items
+                .iter()
+                .any(|item| configured_token_name(item) == Some("$quota_cache"))
+                && items
+                    .iter()
+                    .any(|item| configured_token_name(item) == Some("$quota_cache_ttl"))
+        }));
+    }
+
+    #[test]
+    fn gives_no_cached_a_red_token_without_spending_an_extra_metadata_slot() {
+        let updated =
+            add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
+        let document = updated.parse::<DocumentMut>().unwrap();
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        assert!(rows.iter().any(|row| {
+            let items = row.as_array().unwrap();
+            items
+                .iter()
+                .any(|item| configured_token_name(item) == Some("$quota_error"))
+        }));
+        assert!(updated.contains("fg = \"#ca6470\""));
     }
 
     #[test]
@@ -569,5 +714,11 @@ claude = [["state_icon", "agent"]]
         let removed = remove_quota_row(&updated).unwrap();
         assert!(removed.contains("claude = [[\"state_icon\", \"agent\"]]"));
         assert!(!removed.contains("codex ="));
+    }
+
+    #[test]
+    fn empty_sidebar_configuration_round_trips_to_empty() {
+        let updated = add_quota_row("").unwrap();
+        assert_eq!(remove_quota_row(&updated).unwrap(), "");
     }
 }

@@ -8,11 +8,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Quota rows now show a compact `reset` ETA: minutes below one hour, hours and
-  minutes below one day, and days plus hours for longer windows.
+- Context now follows the provider name, while cache diagnostics use two
+  dedicated rows: a one-decimal cumulative session hit rate and the elapsed
+  time since the latest cache-bearing response plus an explicitly approximate
+  TTL estimate when the provider exposes a cache bucket. Claude/Agy collectors
+  use local statusLine/transcript data only; they do not log in or start model
+  requests.
+- Quota rows now show compact `5h`/`7d` window labels with minutes below one
+  hour, hours and minutes below one day, and days plus hours for longer windows.
+- Cache hit rate and remaining cache TTL now share one short, color-separated
+  sidebar row; the verbose last-activity text is no longer shown.
+- Claude's plugin-owned statusLine now receives the configured global watcher
+  interval as its native `refreshInterval`, keeping idle-session reset times
+  fresh without an API call or model request; existing user-owned intervals are
+  preserved.
+- Active turns now start one short-lived global refresh watcher for Claude,
+  Codex, Grok, and Agy. It reads the working provider set once per poll,
+  publishes statusLine cache updates, keeps active fetches debounced, stops
+  when all agents settle, and performs final debounced passes per provider.
+  Polling defaults to 60 seconds and is configurable from 30 seconds to one
+  hour. `install.sh` and `uninstall.sh` provide a build/link/configure and
+  restore/unlink workflow for downloaded checkouts.
 
 ### Fixed
 
+- Grok no longer sticks at `week 0%` after `grok login` switches accounts. A
+  fresh SuperGrok week omits `creditUsagePercent` (proto3 JSON drops zeros),
+  which the parser treated as an unsupported response and then kept the previous
+  login's exhausted snapshot. Omitted/null percent is 0% used (100% remaining),
+  snapshots are stamped with the signed-in `user_id`, and a cache from another
+  account is not published. Codex has the same per-provider cache and now
+  stamps `tokens.account_id` from `~/.codex/auth.json` so a ChatGPT account
+  switch cannot keep the previous user's weekly percent. Claude and Agy read
+  the running CLI's statusLine, so they were not affected.
+- Claude/Agy statusLine collectors now publish atomic observations without
+  waiting on refresh work. Provider refreshes use independent non-blocking
+  leases, and chained user statusLine commands run in a bounded process group
+  so a stalled command cannot leak processes or wedge later invocations.
+- Topic extraction now reads the pane's visible screen instead of rebuilding its
+  wrapped scrollback. The old `--source recent` read took 4.45s and repainted the
+  pane once per call, which is what the user saw as scrolling; `--source visible`
+  costs 0.006s and repaints nothing. The prompt is on screen when a turn starts,
+  which is when the topic changes.
 - Agent events no longer repaint every pane of a provider. Reading a pane makes
   Herdr repaint it, which the user sees as the agent's terminal scrolling up and
   snapping back to the bottom, once on agent detection and twice per turn
@@ -21,6 +58,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A failed or empty topic read now preserves the last published topic instead of
   clearing it, so it no longer churns the token and forces a write on the next
   refresh.
+- The legacy per-tool Grok response hook is no longer installed. Existing
+  plugin-owned copies are removed during configure because the single global
+  watcher now covers active and settled turns without spawning one command per
+  tool call.
+- Expired cache TTL estimates now render as a red `no cached` diagnostic, and
+  Claude payloads without quota fields clear stale window values instead of
+  leaving an old weekly reset on the sidebar.
+- Weekly-only providers now use the readable `week ... reset ...` label; the
+  compact `5h`/`7d` form remains for providers that expose both windows.
 
 - Agent topics now come only from the latest user prompt in pane output. Native
   `Thinking`/`Executing` titles and other AI status text are no longer published
@@ -73,10 +119,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The context row now uses a dedicated violet accent immediately after the
+  provider name. Cache hit rate and remaining TTL share one row with separate
+  teal and amber accents, while metadata publication remains capped at sixteen
+  tokens.
 - Quota formatting is centralized in one presentation module shared by the
   sidebar, dashboard, and statusLine fallbacks. Codex remains weekly-only.
-- Five-hour and weekly quota windows now occupy separate sidebar rows. Missing
-  five-hour tokens are cleared so Herdr elides that row for Codex and Grok.
+- Five-hour and weekly quota windows now share one compact sidebar row. Herdr
+  elides missing tokens and their separators, while each window keeps its own
+  dynamic health color.
 - Sidebar agent cards default to one blank row of separation, while preserving
   an existing `row_gap`. The latest user prompt now precedes compact,
   single-spaced quota rows, and percentages render as whole numbers.

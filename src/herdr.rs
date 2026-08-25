@@ -6,13 +6,14 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 const METADATA_TTL_MS: &str = "86400000";
+const MAX_METADATA_TOKENS: usize = 16;
 const METADATA_TOKEN_NAMES: [&str; 16] = [
-    "quota_badge",
     "quota_state",
-    "quota_icon",
     "quota_provider",
-    "quota_status",
     "quota_summary",
+    "quota_context",
+    "quota_cache",
+    "quota_cache_ttl",
     "quota_5h",
     "quota_5h_normal",
     "quota_5h_warning",
@@ -24,16 +25,55 @@ const METADATA_TOKEN_NAMES: [&str; 16] = [
     "quota_topic",
     "quota_error",
 ];
+const OBSOLETE_METADATA_TOKEN_NAMES: [&str; 2] = ["quota_icon", "quota_status"];
+const LEGACY_METADATA_TOKEN_NAMES: [&str; 2] = ["quota_badge", "quota_session"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
     pub pane_id: String,
     pub providers: Vec<Provider>,
+    pub session_id: Option<String>,
+    pub session_summary: String,
     pub topic: String,
     pub tokens: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AgentState {
+    pub panes: Vec<AgentPane>,
+    pub working_providers: Vec<Provider>,
+}
+
 pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
+    Ok(list_agent_state()?.panes)
+}
+
+/// Read Herdr's agent inventory once and derive both panes and working
+/// providers from that same response. The active-turn watcher uses this
+/// combined view so one poll does not fan out into one `agent list` call per
+/// provider.
+pub fn list_agent_state() -> Result<AgentState> {
+    let value = list_agent_value()?;
+    let mut panes = Vec::new();
+    collect_agent_panes(&value, &mut panes);
+    panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+    panes.dedup_by(|left, right| left.pane_id == right.pane_id);
+    Ok(AgentState {
+        panes,
+        working_providers: working_providers_from(&value),
+    })
+}
+
+/// Return whether at least one pane for a provider is currently working.
+///
+/// This provider-specific helper only asks Herdr for agent metadata; it never
+/// reads terminal output. The global watcher uses [`list_agent_state`] so all
+/// providers share one inventory call per poll.
+pub fn provider_has_working_agent(provider: Provider) -> Result<bool> {
+    Ok(list_agent_state()?.working_providers.contains(&provider))
+}
+
+fn list_agent_value() -> Result<Value> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let output = Command::new(&executable)
         .args(["agent", "list"])
@@ -42,12 +82,7 @@ pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
     if !output.status.success() {
         anyhow::bail!("Herdr agent list failed with {}", output.status);
     }
-    let value: Value = serde_json::from_slice(&output.stdout).context("parse Herdr agent list")?;
-    let mut panes = Vec::new();
-    collect_agent_panes(&value, &mut panes);
-    panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
-    panes.dedup_by(|left, right| left.pane_id == right.pane_id);
-    Ok(panes)
+    serde_json::from_slice(&output.stdout).context("parse Herdr agent list")
 }
 
 pub fn current_agent_providers() -> Result<Vec<Provider>> {
@@ -121,9 +156,18 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         })
                         .collect();
                     let topic = tokens.get("quota_topic").cloned().unwrap_or_default();
+                    let session_summary = tokens.get("quota_session").cloned().unwrap_or_default();
+                    let session_id = map
+                        .get("agent_session")
+                        .and_then(Value::as_object)
+                        .and_then(|session| session.get("value"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
                         providers,
+                        session_id,
+                        session_summary,
                         // Preserve the last published topic during quota-only
                         // refreshes. Agent events refresh it from pane output.
                         topic,
@@ -138,6 +182,57 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
         Value::Array(values) => {
             for child in values {
                 collect_agent_panes(child, panes);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn working_providers_from(value: &Value) -> Vec<Provider> {
+    let mut providers = Vec::new();
+    collect_working_providers(value, &mut providers);
+    providers.sort_by_key(|provider| {
+        Provider::ALL
+            .iter()
+            .position(|candidate| candidate == provider)
+    });
+    providers.dedup();
+    providers
+}
+
+fn collect_working_providers(value: &Value, providers: &mut Vec<Provider>) {
+    match value {
+        Value::Object(map) => {
+            let kind = map
+                .get("agent")
+                .and_then(Value::as_str)
+                .or_else(|| map.get("kind").and_then(Value::as_str))
+                .or_else(|| {
+                    map.get("agent_session")
+                        .and_then(Value::as_object)
+                        .and_then(|session| session.get("agent"))
+                        .and_then(Value::as_str)
+                });
+            let status = map
+                .get("agent_status")
+                .or_else(|| map.get("agentStatus"))
+                .or_else(|| map.get("status"))
+                .or_else(|| map.get("state"))
+                .and_then(Value::as_str);
+            if let (Some(kind), Some(status)) = (kind, status) {
+                if status.eq_ignore_ascii_case("working") {
+                    if let Ok(provider) = kind.parse::<Provider>() {
+                        providers.push(provider);
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_working_providers(child, providers);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_working_providers(child, providers);
             }
         }
         _ => {}
@@ -164,7 +259,7 @@ pub fn publish_tokens(
         if supported.is_empty() {
             continue;
         }
-        let topic = truncate_topic(&pane.topic);
+        let topic = display_topic(pane);
         let desired = if pane.providers.len() > 1 {
             desired_multi_provider_tokens(&pane.providers, tokens, &topic)
         } else {
@@ -192,7 +287,7 @@ pub fn publish_tokens(
             ])
             .args(["--seq", &sequence.to_string()])
             .args(["--ttl-ms", METADATA_TTL_MS]);
-        for name in METADATA_TOKEN_NAMES {
+        for name in metadata_report_names(pane, &desired) {
             if let Some(value) = desired.get(name) {
                 command.args(["--token", &format!("{name}={value}")]);
             } else {
@@ -238,13 +333,13 @@ fn pane_is_scrolled(executable: &std::ffi::OsStr, pane_id: &str) -> bool {
 
 fn desired_tokens(values: &MetadataTokens, topic: &str) -> BTreeMap<String, String> {
     let mut tokens = BTreeMap::from([
-        ("quota_badge".to_string(), values.quota_badge.clone()),
         ("quota_state".to_string(), values.quota_state.clone()),
-        ("quota_icon".to_string(), values.quota_icon.clone()),
         ("quota_provider".to_string(), values.quota_provider.clone()),
-        ("quota_status".to_string(), values.quota_status.clone()),
         ("quota_summary".to_string(), values.quota_summary.clone()),
     ]);
+    insert_optional_token(&mut tokens, "quota_context", &values.quota_context);
+    insert_optional_token(&mut tokens, "quota_cache", &values.quota_cache);
+    insert_optional_token(&mut tokens, "quota_cache_ttl", &values.quota_cache_ttl);
     insert_optional_token(&mut tokens, "quota_5h", &values.quota_5h);
     insert_severity_token(
         &mut tokens,
@@ -295,11 +390,8 @@ fn desired_multi_provider_tokens(
     }
     if let Some((_, values)) = identity {
         for (name, value) in [
-            ("quota_badge", &values.quota_badge),
             ("quota_state", &values.quota_state),
-            ("quota_icon", &values.quota_icon),
             ("quota_provider", &values.quota_provider),
-            ("quota_status", &values.quota_status),
             ("quota_summary", &values.quota_summary),
         ] {
             desired.insert(name.to_string(), value.clone());
@@ -338,6 +430,14 @@ fn severity_rank(severity: crate::model::Severity) -> u8 {
     }
 }
 
+fn display_topic(pane: &AgentPane) -> String {
+    let topic = pane.topic.trim();
+    if topic.is_empty() || is_status_line(topic) {
+        return truncate_topic(&pane.session_summary);
+    }
+    truncate_topic(topic)
+}
+
 fn metadata_matches(
     current: &BTreeMap<String, String>,
     desired: &BTreeMap<String, String>,
@@ -345,6 +445,68 @@ fn metadata_matches(
     METADATA_TOKEN_NAMES
         .into_iter()
         .all(|name| current.get(name) == desired.get(name))
+        && OBSOLETE_METADATA_TOKEN_NAMES
+            .into_iter()
+            .all(|name| !current.contains_key(name))
+        && LEGACY_METADATA_TOKEN_NAMES
+            .into_iter()
+            .all(|name| !current.contains_key(name))
+}
+
+fn metadata_report_names(
+    pane: &AgentPane,
+    desired: &BTreeMap<String, String>,
+) -> Vec<&'static str> {
+    let mut names = METADATA_TOKEN_NAMES
+        .into_iter()
+        .filter(|name| desired.contains_key(*name) || pane.tokens.contains_key(*name))
+        .collect::<Vec<_>>();
+    let cleanup_names = OBSOLETE_METADATA_TOKEN_NAMES
+        .into_iter()
+        .filter(|name| pane.tokens.contains_key(*name))
+        .chain(
+            LEGACY_METADATA_TOKEN_NAMES
+                .into_iter()
+                .filter(|name| pane.tokens.contains_key(*name)),
+        )
+        .collect::<Vec<_>>();
+    if names.len() + cleanup_names.len() <= MAX_METADATA_TOKENS {
+        names.extend(cleanup_names);
+        return names;
+    }
+
+    // Herdr accepts at most sixteen token arguments. Reserve room for stale
+    // names first so an upgraded pane can actually clear them; unchanged
+    // cosmetic fields can be restored on the next bounded report.
+    let active_capacity = MAX_METADATA_TOKENS.saturating_sub(cleanup_names.len());
+    for candidate in ["quota_summary", "quota_state", "quota_5h", "quota_week"] {
+        while names.len() > active_capacity {
+            let Some(index) = names.iter().position(|name| {
+                *name == candidate && pane.tokens.get(candidate) == desired.get(candidate)
+            }) else {
+                break;
+            };
+            names.remove(index);
+        }
+    }
+    while names.len() > active_capacity {
+        let Some(index) = names.iter().position(|name| {
+            !matches!(
+                *name,
+                "quota_context"
+                    | "quota_cache"
+                    | "quota_cache_ttl"
+                    | "quota_provider"
+                    | "quota_topic"
+            )
+        }) else {
+            break;
+        };
+        names.remove(index);
+    }
+    names.truncate(active_capacity);
+    names.extend(cleanup_names);
+    names
 }
 
 fn insert_severity_token(
@@ -375,23 +537,25 @@ fn insert_optional_token(tokens: &mut BTreeMap<String, String>, name: &str, valu
     }
 }
 
+// `recent` rebuilds the pane's wrapped scrollback, which takes seconds and
+// repaints the pane: the agent's terminal visibly scrolls, once per read.
+// `visible` is the current screen only, costs microseconds, and repaints
+// nothing. The prompt is on screen at the moment idle->working fires, which is
+// exactly when the topic changes; later in the turn it may have scrolled off,
+// and then the caller keeps the topic it already published.
+fn topic_read_args(pane_id: &str) -> [&str; 7] {
+    [
+        "pane", "read", pane_id, "--source", "visible", "--format", "text",
+    ]
+}
+
 fn read_pane_topic(
     executable: &std::ffi::OsStr,
     pane: &AgentPane,
     provider: &Provider,
 ) -> Option<String> {
     let output = Command::new(executable)
-        .args([
-            "pane",
-            "read",
-            &pane.pane_id,
-            "--source",
-            "recent",
-            "--lines",
-            "160",
-            "--format",
-            "text",
-        ])
+        .args(topic_read_args(&pane.pane_id))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -448,6 +612,7 @@ fn is_status_line(value: &str) -> bool {
         || lower.starts_with("session ")
         || lower.starts_with("auto mode")
         || lower.starts_with("shift+tab")
+        || lower == "ask codex to do anything"
         || matches!(
             lower.as_str(),
             "/clear" | "/compact" | "/help" | "/status" | "/usage" | "/model" | "/config"
@@ -478,12 +643,16 @@ mod tests {
                 AgentPane {
                     pane_id: "w1:p1".to_string(),
                     providers: vec![Provider::Codex],
+                    session_id: None,
+                    session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
                     providers: vec![Provider::Claude],
+                    session_id: None,
+                    session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
                 },
@@ -517,6 +686,147 @@ mod tests {
     }
 
     #[test]
+    fn discovers_codex_session_id_and_preserves_session_summary() {
+        let value = json!({"result": {"agents": [{
+            "pane_id": "w1:p1",
+            "agent": "codex",
+            "agent_session": {"agent": "codex", "value": "thread-1"},
+            "tokens": {"quota_session": "previous summary"}
+        }]}});
+        let mut panes = Vec::new();
+        collect_agent_panes(&value, &mut panes);
+        assert_eq!(panes[0].session_id.as_deref(), Some("thread-1"));
+        assert_eq!(panes[0].session_summary, "previous summary");
+    }
+
+    #[test]
+    fn legacy_metadata_tokens_force_one_bounded_cleanup_report() {
+        let pane = AgentPane {
+            pane_id: "w1:p1".to_string(),
+            providers: vec![Provider::Claude],
+            session_id: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([(String::from("quota_badge"), String::from("[A]"))]),
+        };
+        let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
+        assert!(!metadata_matches(&pane.tokens, &desired));
+        let names = metadata_report_names(&pane, &desired);
+        assert!(names.contains(&"quota_badge"));
+        assert!(names.len() <= MAX_METADATA_TOKENS);
+    }
+
+    #[test]
+    fn cache_diagnostics_stay_inside_herdr_metadata_cap() {
+        let snapshot = crate::model::ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                crate::model::UsageWindow::new(crate::model::WindowKind::FiveHour, 20.0, None)
+                    .unwrap(),
+                crate::model::UsageWindow::new(crate::model::WindowKind::Weekly, 30.0, None)
+                    .unwrap(),
+            ],
+            0,
+        )
+        .with_context(Some(
+            crate::model::ContextUsage::new(42.0)
+                .unwrap()
+                .with_cache(Some(
+                    crate::model::CacheUsage::from_token_counts(100, 800, 100)
+                        .unwrap()
+                        .with_ttl_estimate(3_600, 0)
+                        .with_session_totals(
+                            crate::model::CacheTotals::from_token_counts(100, 800, 100),
+                            "session-1",
+                            1,
+                        ),
+                )),
+        ));
+        let desired = desired_tokens(&MetadataTokens::from_snapshot(&snapshot, 0), "prompt");
+        let pane = AgentPane {
+            pane_id: "w1:p1".to_string(),
+            providers: vec![Provider::Claude],
+            session_id: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+        };
+        let names = metadata_report_names(&pane, &desired);
+        assert!(names.len() <= MAX_METADATA_TOKENS);
+        assert!(names.contains(&"quota_cache"));
+        assert!(names.contains(&"quota_cache_ttl"));
+    }
+
+    #[test]
+    fn stale_metadata_tokens_are_reported_for_cleanup_with_new_cache_rows() {
+        let snapshot = crate::model::ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                crate::model::UsageWindow::new(crate::model::WindowKind::FiveHour, 20.0, None)
+                    .unwrap(),
+                crate::model::UsageWindow::new(crate::model::WindowKind::Weekly, 30.0, None)
+                    .unwrap(),
+            ],
+            0,
+        )
+        .with_context(Some(
+            crate::model::ContextUsage::new(42.0)
+                .unwrap()
+                .with_cache(Some(
+                    crate::model::CacheUsage::from_token_counts(100, 800, 100)
+                        .unwrap()
+                        .with_ttl_estimate(3_600, 0)
+                        .with_session_totals(
+                            crate::model::CacheTotals::from_token_counts(100, 800, 100),
+                            "session-1",
+                            1,
+                        ),
+                )),
+        ));
+        let desired = desired_tokens(&MetadataTokens::from_snapshot(&snapshot, 0), "prompt");
+        let mut tokens = desired.clone();
+        tokens.insert("quota_icon".to_string(), "✦Cl".to_string());
+        tokens.insert("quota_status".to_string(), "OK".to_string());
+        tokens.insert("quota_badge".to_string(), "[C]".to_string());
+        tokens.insert("quota_session".to_string(), "old".to_string());
+        let pane = AgentPane {
+            pane_id: "w1:p1".to_string(),
+            providers: vec![Provider::Claude],
+            session_id: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens,
+        };
+        let names = metadata_report_names(&pane, &desired);
+        assert!(names.len() <= MAX_METADATA_TOKENS);
+        assert!(names.contains(&"quota_cache"));
+        assert!(names.contains(&"quota_cache_ttl"));
+        assert!(names.contains(&"quota_icon"));
+        assert!(names.contains(&"quota_status"));
+        assert!(names.contains(&"quota_badge"));
+        assert!(names.contains(&"quota_session"));
+    }
+
+    #[test]
+    fn working_agent_detection_handles_herdr_agent_list_shape() {
+        let value = json!({"result": {"agents": [
+            {"agent": "claude", "agent_status": "working"},
+            {"agent": "codex", "agent_status": "idle"}
+        ]}});
+        assert_eq!(working_providers_from(&value), vec![Provider::Claude]);
+    }
+
+    #[test]
+    fn one_agent_inventory_deduplicates_working_providers() {
+        let value = json!({"result": {"agents": [
+            {"agent": "codex", "agent_status": "working"},
+            {"agent_session": {"agent": "codex"}, "status": "working"},
+            {"agent": "claude", "agent_status": "idle"}
+        ]}});
+        assert_eq!(working_providers_from(&value), vec![Provider::Codex]);
+    }
+
+    #[test]
     fn extracts_latest_agy_prompt_instead_of_status_line() {
         let text = "> older\nHello\n> hi\nHello!\n> Accept-edits mode: file edits auto-approved\n";
         assert_eq!(extract_topic(text, Provider::Agy).as_deref(), Some("hi"));
@@ -526,6 +836,14 @@ mod tests {
     fn extracts_latest_claude_prompt_and_skips_clear_command() {
         let text = "❯ /clear\n❯ hi\n⏺ Hi! What can I help with?\n❯\n";
         assert_eq!(extract_topic(text, Provider::Claude).as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn ignores_codex_default_prompt_placeholder() {
+        assert_eq!(
+            extract_topic("› Ask Codex to do anything\n", Provider::Codex),
+            None
+        );
     }
 
     #[test]
@@ -564,6 +882,16 @@ mod tests {
             extract_topic(text, Provider::Grok).as_deref(),
             Some("/goal 你在 ti 工作区接手 L7")
         );
+    }
+
+    // `recent` and `recent-unwrapped` rebuild the pane's wrapped scrollback,
+    // which repaints it: one read, one visible scroll for the user.
+    #[test]
+    fn topic_reads_never_rebuild_a_pane_scrollback() {
+        let args = topic_read_args("w1:p1");
+        assert!(args.contains(&"visible"));
+        assert!(!args.contains(&"recent"));
+        assert!(!args.contains(&"recent-unwrapped"));
     }
 
     #[test]
@@ -647,7 +975,9 @@ mod tests {
             desired.get("quota_provider").map(String::as_str),
             Some("Codex")
         );
-        assert_eq!(desired.get("quota_status").map(String::as_str), Some("OK"));
+        assert_eq!(desired.get("quota_state").map(String::as_str), Some("●"));
+        assert!(!desired.contains_key("quota_badge"));
+        assert!(!desired.contains_key("quota_status"));
 
         // A worse severity on Grok takes the identity slots over.
         let tokens = vec![
@@ -665,9 +995,9 @@ mod tests {
             desired.get("quota_provider").map(String::as_str),
             Some("Grok")
         );
-        assert_eq!(desired.get("quota_badge").map(String::as_str), Some("[X]"));
         assert_eq!(desired.get("quota_state").map(String::as_str), Some("!"));
-        assert_eq!(desired.get("quota_status").map(String::as_str), Some("LOW"));
+        assert!(!desired.contains_key("quota_badge"));
+        assert!(!desired.contains_key("quota_status"));
 
         // With no Grok data at all the card still renders Codex alone.
         let codex_only = vec![(

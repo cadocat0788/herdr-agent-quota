@@ -4,6 +4,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn install_herdr_stub(state: &Path, agent_list: &str) -> (PathBuf, PathBuf) {
@@ -36,6 +38,55 @@ fn run_claude_collector(state: &Path, herdr: &Path, input: &[u8]) {
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
+}
+
+fn run_claude_collector_with_timeout(state: &Path, input: &[u8], timeout: Duration) -> bool {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("claude-statusline")
+        .env("HERDR_PLUGIN_STATE_DIR", state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.success();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn hold_refresh_lock_in_child(state: &Path) -> std::process::Child {
+    let lock_path = state.join("refresh.lock");
+    let ready_path = state.join("refresh.lock.ready");
+    let locker = Command::new("perl")
+        .args([
+            "-e",
+            r#"use Fcntl qw(:flock); open my $f, '+>', $ARGV[0] or die $!; flock($f, LOCK_EX) or die $!; open my $r, '>', $ARGV[1] or die $!; print $r 'locked'; close $r; sleep 20"#,
+            lock_path.to_str().unwrap(),
+            ready_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "refresh lock helper did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    locker
 }
 
 fn run_claude_refresh(state: &Path, herdr: &Path) {
@@ -94,6 +145,12 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(applied.contains("$quota_week_danger"));
     assert!(!applied.contains("[\"$quota_summary\"]"));
     assert!(applied.contains("$quota_topic"));
+    assert!(applied.contains("$quota_context"));
+    assert!(applied.contains("fg = \"#9b8fd8\""));
+    assert!(applied.find("$quota_provider").unwrap() < applied.find("$quota_context").unwrap());
+    assert!(applied.contains("$quota_cache"));
+    assert!(applied.contains("$quota_cache_ttl"));
+    assert!(applied.contains("fg = \"#6fb5b7\""));
     assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
     assert!(applied.find("$quota_topic").unwrap() < applied.find("$quota_5h_normal").unwrap());
     assert!(applied.contains("fg = \"#84b084\""));
@@ -104,6 +161,17 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(applied.contains("fg = \"#7998b7\""));
     assert!(applied.contains("fg = \"#acb4c3\""));
     assert!(applied.contains("fg = \"#84b0af\""));
+}
+
+#[test]
+fn configuration_removes_obsolete_session_summary_rows() {
+    let original = concat!(
+        "[ui.sidebar.agents]\n",
+        "rows = [[\"state_icon\", \"agent\"], [\"$quota_topic\"], [\"$quota_session\"]]\n"
+    );
+    let applied = add_quota_row(original).unwrap();
+    assert!(applied.contains("$quota_context"));
+    assert!(!applied.contains("$quota_session"));
 }
 
 #[test]
@@ -138,6 +206,42 @@ fn claude_collector_is_silent_without_a_previous_statusline() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn claude_collector_does_not_wait_for_a_refresh_lock() {
+    let state = tempdir().unwrap();
+    let mut locker = hold_refresh_lock_in_child(state.path());
+
+    assert!(run_claude_collector_with_timeout(
+        state.path(),
+        include_bytes!("fixtures/claude/statusline-both.json"),
+        Duration::from_secs(2),
+    ));
+    assert!(state
+        .path()
+        .join("claude-statusline.observation.json")
+        .exists());
+    let _ = locker.kill();
+    let _ = locker.wait();
+}
+
+#[test]
+fn claude_collector_bounds_a_hanging_previous_statusline() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("claude-statusline.original.json"),
+        r#"{"type":"command","command":"sleep 20"}"#,
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    assert!(run_claude_collector_with_timeout(
+        state.path(),
+        include_bytes!("fixtures/claude/statusline-both.json"),
+        Duration::from_secs(4),
+    ));
+    assert!(started.elapsed() < Duration::from_secs(4));
 }
 
 #[test]
@@ -180,9 +284,63 @@ fn claude_cache_is_published_by_refresh_event() {
     assert!(!report.contains("pane read"));
     // Single-provider panes publish bare values; the kind prefix only ever
     // appears on multi-provider cards.
-    assert!(report.contains("quota_5h=5h 42% reset"));
-    assert!(report.contains("quota_week=week 73% reset"));
+    assert!(report.contains("quota_5h=5h 42%"));
+    assert!(report.contains("quota_week=7d 73%"));
+    assert!(!report.contains("quota_5h=claude"));
     assert!(!report.contains("quota_week=claude"));
+}
+
+#[test]
+fn claude_statusline_without_rate_limits_clears_stale_quota_windows() {
+    let state = tempdir().unwrap();
+    let (herdr_stub, _herdr_log) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1"}]}}"#,
+    );
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        include_bytes!("fixtures/claude/statusline-both.json"),
+    );
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        br#"{"context_window":{"used_percentage":43.0}}"#,
+    );
+    run_claude_refresh(state.path(), &herdr_stub);
+
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.path().join("claude-statusline.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["windows"].as_array().unwrap().len(), 0);
+    assert_eq!(snapshot["context"]["used_percent"], 43.0);
+}
+
+#[test]
+fn statusline_without_context_keeps_the_last_context_snapshot() {
+    let state = tempdir().unwrap();
+    let (herdr_stub, herdr_log) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1"}]}}"#,
+    );
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        br#"{
+            "context_window": {"used_percentage": 23.5},
+            "rate_limits": {"seven_day": {"used_percentage": 27.0}}
+        }"#,
+    );
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        br#"{"rate_limits":{"seven_day":{"used_percentage":28.0}}}"#,
+    );
+
+    run_claude_refresh(state.path(), &herdr_stub);
+    let report = fs::read_to_string(herdr_log).unwrap();
+    assert!(report.contains("quota_context=context 24%"));
+    assert!(report.contains("quota_week=week 72%"));
 }
 
 #[test]
@@ -310,7 +468,7 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let state = tempdir().unwrap();
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
-        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","tokens":{"quota_badge":"[A]","quota_state":"?","quota_icon":"✦Cl","quota_provider":"Claude","quota_status":"N/A","quota_5h":"5h 42%","quota_5h_warning":"5h 42%","quota_week":"week 73%","quota_week_warning":"week 73%","quota_summary":"5h 42% · week 73%"}}]}}"#,
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","tokens":{"quota_state":"?","quota_provider":"Claude","quota_5h":"5h 42%","quota_5h_warning":"5h 42%","quota_week":"7d 73%","quota_week_warning":"7d 73%","quota_summary":"5h 42% · week 73%"}}]}}"#,
     );
 
     let input = br#"{
@@ -362,6 +520,8 @@ fn opencode_event_publishes_both_subscription_windows_without_reading_the_pane()
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", state.path().join("missing-codex"))
+        // Keep the account gate away from the machine's real Codex login.
+        .env("CODEX_AUTH_FILE", state.path().join("missing-auth.json"))
         .env("GROK_HOME", state.path().join("missing-grok-home"))
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
@@ -386,7 +546,9 @@ fn opencode_event_publishes_both_subscription_windows_without_reading_the_pane()
     assert!(calls.contains("--token quota_week_warning=codex week 75%"));
     assert!(calls.contains("--token quota_5h_warning=grok week 40%"));
     assert!(calls.contains("--token quota_provider=Codex"));
-    assert!(calls.contains("--token quota_badge=[C]"));
+    // Badge/status tokens are retired upstream; the merged card must not
+    // resurrect them.
+    assert!(!calls.contains("quota_badge"));
 }
 
 #[test]
@@ -436,6 +598,6 @@ fn configure_writes_and_removes_a_managed_opencode_sidebar_entry() {
     assert!(removed.status.success());
     let restored = fs::read_to_string(&config).unwrap();
     assert!(!restored.contains("opencode = [["));
-    // apply normalizes the official row, mapping workspace back to tab.
-    assert!(restored.contains("[[\"state_icon\", \"tab\"]]"));
+    // Upstream restores the user's rows verbatim from the backup.
+    assert!(restored.contains("[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]"));
 }
