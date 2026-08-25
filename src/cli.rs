@@ -25,6 +25,7 @@ pub enum Command {
     Event,
     Focus,
     Dashboard,
+    Status,
     Configure {
         #[arg(long, conflicts_with_all = ["apply", "uninstall"])]
         check: bool,

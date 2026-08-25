@@ -13,6 +13,7 @@ fn main() -> Result<()> {
         Command::Event => herdr_agent_quota::refresh::event(),
         Command::Focus => herdr_agent_quota::refresh::focus(),
         Command::Dashboard => herdr_agent_quota::dashboard::run(),
+        Command::Status => herdr_agent_quota::status::run(),
         Command::Configure {
             check,
             apply,

@@ -108,7 +108,7 @@ fn format_window(window: &UsageWindow, now_unix: u64, include_left: bool) -> Str
     format!("{label} reset {eta}")
 }
 
-fn format_reset_eta(reset_at: ResetAt, now_unix: u64) -> String {
+pub fn format_reset_eta(reset_at: ResetAt, now_unix: u64) -> String {
     let seconds = reset_at.unix_seconds().saturating_sub(now_unix);
     if seconds == 0 {
         return "due".to_string();

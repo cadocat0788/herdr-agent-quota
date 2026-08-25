@@ -8,3 +8,4 @@ pub mod dashboard;
 pub mod herdr;
 pub mod providers;
 pub mod refresh;
+pub mod status;
