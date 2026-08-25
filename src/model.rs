@@ -9,10 +9,20 @@ pub enum Provider {
     Grok,
     Claude,
     Agy,
+    // Keep the cached snapshot's provider field consistent with source();
+    // plain lowercase would render the variant as "opencodego".
+    #[serde(rename = "opencode-go")]
+    OpenCodeGo,
 }
 
 impl Provider {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::Grok, Self::Claude, Self::Agy];
+    pub const ALL: [Self; 5] = [
+        Self::Codex,
+        Self::Grok,
+        Self::Claude,
+        Self::Agy,
+        Self::OpenCodeGo,
+    ];
 
     pub fn badge(self) -> &'static str {
         match self {
@@ -20,6 +30,7 @@ impl Provider {
             Self::Grok => "[X]",
             Self::Claude => "[A]",
             Self::Agy => "[G]",
+            Self::OpenCodeGo => "[O]",
         }
     }
 
@@ -31,6 +42,7 @@ impl Provider {
             Self::Grok => "✕G",
             Self::Claude => "✦Cl",
             Self::Agy => "△Ag",
+            Self::OpenCodeGo => "◆Go",
         }
     }
 
@@ -40,6 +52,7 @@ impl Provider {
             Self::Grok => "Grok",
             Self::Claude => "Claude",
             Self::Agy => "Agy",
+            Self::OpenCodeGo => "OpenCode Go",
         }
     }
 
@@ -49,6 +62,7 @@ impl Provider {
             Self::Grok => "grok-cli-billing",
             Self::Claude => "claude-statusline",
             Self::Agy => "agy-statusline",
+            Self::OpenCodeGo => "opencode-go",
         }
     }
 
@@ -60,6 +74,7 @@ impl Provider {
             Self::Grok => "grok",
             Self::Claude => "claude",
             Self::Agy => "agy",
+            Self::OpenCodeGo => "go",
         }
     }
 }
@@ -75,7 +90,11 @@ impl Provider {
             "grok" => Some(vec![Self::Grok]),
             "claude" | "claude-code" | "anthropic" => Some(vec![Self::Claude]),
             "agy" | "antigravity" | "antigravity-cli" => Some(vec![Self::Agy]),
+            // OpenCodeGo is deliberately absent from the opencode card: the
+            // user removed quota rows from opencode pane cards, so the Go
+            // collector feeds only the status strip and dashboard.
             "opencode" => Some(vec![Self::Codex, Self::Grok]),
+            "opencode-go" | "go" => Some(vec![Self::OpenCodeGo]),
             _ => None,
         }
     }
@@ -101,6 +120,7 @@ impl std::str::FromStr for Provider {
 pub enum WindowKind {
     FiveHour,
     Weekly,
+    Monthly,
 }
 
 impl WindowKind {
@@ -108,6 +128,7 @@ impl WindowKind {
         match self {
             Self::FiveHour => "5h",
             Self::Weekly => "week",
+            Self::Monthly => "month",
         }
     }
 
@@ -115,6 +136,9 @@ impl WindowKind {
         match self {
             Self::FiveHour => 5 * 60 * 60,
             Self::Weekly => 7 * 24 * 60 * 60,
+            // A nominal 30-day month; severity only compares this against the
+            // time left before reset, so an approximation is enough.
+            Self::Monthly => 30 * 24 * 60 * 60,
         }
     }
 }
@@ -221,12 +245,25 @@ impl ProviderSnapshot {
         self.windows.iter().find(|window| window.kind == kind)
     }
 
+    /// The window closest to exhaustion, so a multi-window provider shows
+    /// whichever limit will bite first.
+    pub fn most_consumed_window(&self) -> Option<&UsageWindow> {
+        self.windows.iter().min_by(|left, right| {
+            left.remaining_percent
+                .partial_cmp(&right.remaining_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
     pub fn severity(&self, now_unix: u64) -> Severity {
         let relevant = match self.provider {
             Provider::Codex | Provider::Grok => self.window(WindowKind::Weekly),
             Provider::Claude | Provider::Agy => self
                 .window(WindowKind::FiveHour)
                 .or_else(|| self.window(WindowKind::Weekly)),
+            // Go reports three independent windows; the binding one is the
+            // closest to exhaustion.
+            Provider::OpenCodeGo => self.most_consumed_window(),
         };
         relevant
             .map(|window| Severity::for_window(window, now_unix))
@@ -367,14 +404,36 @@ mod tests {
 
     #[test]
     fn opencode_maps_to_codex_and_grok_subscription_quota() {
-        assert_eq!(
-            Provider::providers_for_agent("opencode"),
-            Some(vec![Provider::Codex, Provider::Grok])
-        );
+        let mapping = Provider::providers_for_agent("opencode");
+        assert_eq!(mapping, Some(vec![Provider::Codex, Provider::Grok]));
+        // OpenCodeGo is status/dashboard-only by design; the pane card keeps
+        // its original two subscriptions.
+        assert!(mapping.is_none_or(|providers| !providers.contains(&Provider::OpenCodeGo)));
         assert_eq!(
             Provider::providers_for_agent("  OpenCode\t"),
             Some(vec![Provider::Codex, Provider::Grok])
         );
+    }
+
+    #[test]
+    fn opencode_go_parses_from_canonical_name_and_go_alias() {
+        assert_eq!(
+            "opencode-go".parse::<Provider>().unwrap(),
+            Provider::OpenCodeGo
+        );
+        assert_eq!("go".parse::<Provider>().unwrap(), Provider::OpenCodeGo);
+        assert_eq!("GO".parse::<Provider>().unwrap(), Provider::OpenCodeGo);
+    }
+
+    #[test]
+    fn every_provider_is_reachable_from_the_all_list() {
+        for provider in Provider::ALL {
+            assert_eq!(
+                provider.agent_kind().parse::<Provider>().unwrap(),
+                provider,
+                "agent_kind() must round-trip through FromStr"
+            );
+        }
     }
 
     #[test]

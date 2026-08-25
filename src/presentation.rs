@@ -47,11 +47,11 @@ impl MetadataTokens {
             quota_provider: provider.display_name().to_string(),
             quota_status: Severity::Unknown.label().to_string(),
             quota_5h: match provider {
-                Provider::Claude | Provider::Agy => "5h N/A".to_string(),
+                Provider::Claude | Provider::Agy | Provider::OpenCodeGo => "5h N/A".to_string(),
                 Provider::Codex | Provider::Grok => String::new(),
             },
             quota_5h_severity: match provider {
-                Provider::Claude | Provider::Agy => Some(Severity::Unknown),
+                Provider::Claude | Provider::Agy | Provider::OpenCodeGo => Some(Severity::Unknown),
                 Provider::Codex | Provider::Grok => None,
             },
             quota_week: "week N/A".to_string(),
@@ -82,12 +82,16 @@ pub fn dashboard_summary(snapshot: &ProviderSnapshot, now_unix: u64) -> String {
 }
 
 fn summary(snapshot: &ProviderSnapshot, now_unix: u64, include_left: bool) -> String {
-    [WindowKind::FiveHour, WindowKind::Weekly]
-        .into_iter()
-        .filter_map(|kind| snapshot.window(kind))
-        .map(|window| format_window(window, now_unix, include_left))
-        .collect::<Vec<_>>()
-        .join(" · ")
+    [
+        WindowKind::FiveHour,
+        WindowKind::Weekly,
+        WindowKind::Monthly,
+    ]
+    .into_iter()
+    .filter_map(|kind| snapshot.window(kind))
+    .map(|window| format_window(window, now_unix, include_left))
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn sidebar_window(snapshot: &ProviderSnapshot, kind: WindowKind, now_unix: u64) -> String {
@@ -175,6 +179,27 @@ mod tests {
         let weekly = format_window(&window(WindowKind::Weekly, 75.0, 183_600), 0, false);
         assert_eq!(five_hour, "5h 43% reset 4h07m");
         assert_eq!(weekly, "week 25% reset 2d3h");
+    }
+
+    #[test]
+    fn opencode_go_windows_render_including_the_month_label() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::OpenCodeGo,
+            vec![
+                window(WindowKind::FiveHour, 0.0, 14_820),
+                window(WindowKind::Weekly, 0.0, 183_600),
+                window(WindowKind::Monthly, 72.0, 400_000),
+            ],
+            0,
+        );
+        assert_eq!(
+            sidebar_summary(&snapshot, 0),
+            "5h 100% reset 4h07m · week 100% reset 2d3h · month 28% reset 4d15h"
+        );
+        assert_eq!(
+            dashboard_summary(&snapshot, 0),
+            "5h 100% left reset 4h07m · week 100% left reset 2d3h · month 28% left reset 4d15h"
+        );
     }
 
     #[test]

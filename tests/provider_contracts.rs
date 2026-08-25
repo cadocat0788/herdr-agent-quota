@@ -1,5 +1,5 @@
 use herdr_agent_quota::model::{ResetAt, WindowKind};
-use herdr_agent_quota::providers::{agy, claude, codex, grok};
+use herdr_agent_quota::providers::{agy, claude, codex, grok, opencode_go};
 use serde_json::Value;
 
 fn fixture(value: &str) -> Value {
@@ -71,4 +71,65 @@ fn agy_fixture_aggregates_gemini_and_third_party_windows() {
             .abs()
             < 1e-9
     );
+}
+
+#[test]
+fn opencode_go_fixture_caches_three_windows_with_remaining_conversion() {
+    let value = fixture(include_str!("fixtures/opencode-go/usage-all-windows.json"));
+    let snapshot = opencode_go::parse_usage_response(&value, 1).unwrap();
+    assert_eq!(
+        snapshot.provider,
+        herdr_agent_quota::model::Provider::OpenCodeGo
+    );
+    assert_eq!(snapshot.windows.len(), 3);
+    // The endpoint reports percent used; the cache stores percent remaining.
+    assert_eq!(
+        snapshot
+            .window(WindowKind::FiveHour)
+            .unwrap()
+            .remaining_percent,
+        100.0
+    );
+    assert_eq!(
+        snapshot
+            .window(WindowKind::Weekly)
+            .unwrap()
+            .remaining_percent,
+        100.0
+    );
+    assert_eq!(
+        snapshot
+            .window(WindowKind::Monthly)
+            .unwrap()
+            .remaining_percent,
+        28.0
+    );
+    // resetsAt is RFC3339 with fractional seconds.
+    assert_eq!(
+        snapshot.window(WindowKind::Monthly).unwrap().resets_at,
+        Some(ResetAt::from_unix_seconds(1_787_954_935))
+    );
+}
+
+#[test]
+fn opencode_go_error_bodies_are_unavailable_not_zero() {
+    let auth = fixture(include_str!("fixtures/opencode-go/error-auth.json"));
+    assert!(matches!(
+        opencode_go::error_from_status(401, &auth),
+        herdr_agent_quota::providers::ProviderError::MissingCredentials
+    ));
+    let entitlement = fixture(include_str!("fixtures/opencode-go/error-entitlement.json"));
+    let error = opencode_go::error_from_status(403, &entitlement);
+    assert_eq!(
+        error.to_string(),
+        "provider quota is unavailable: OpenCode Go subscription required."
+    );
+}
+
+#[test]
+fn opencode_go_rejects_payloads_without_interpretable_windows() {
+    let missing = fixture(r#"{"usage":{}}"#);
+    assert!(opencode_go::parse_usage_response(&missing, 1).is_err());
+    let no_usage = fixture(r#"{"error":{"type":"AuthError"}}"#);
+    assert!(opencode_go::parse_usage_response(&no_usage, 1).is_err());
 }

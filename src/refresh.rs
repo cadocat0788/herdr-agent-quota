@@ -2,7 +2,7 @@ use crate::cache::CacheStore;
 use crate::herdr::{current_agent_providers, list_agent_panes, publish_tokens, refresh_pane_topic};
 use crate::model::Provider;
 use crate::presentation::MetadataTokens;
-use crate::providers::{codex, grok};
+use crate::providers::{codex, grok, opencode_go};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -55,6 +55,15 @@ pub fn focus() -> Result<()> {
     run(&providers, false, false)
 }
 
+/// Refresh one provider under the state-dir lock with the standard 60s
+/// debounce, skipping pane publication entirely. The status poll uses this so
+/// the Go collector gets refreshed without ever touching a pane.
+pub fn debounced_refresh(provider: Provider) -> Result<()> {
+    let cache = CacheStore::from_env()?;
+    cache.with_lock(|| refresh_locked(&cache, &[provider], false))?;
+    Ok(())
+}
+
 fn refresh_locked(
     cache: &CacheStore,
     providers: &[Provider],
@@ -75,6 +84,7 @@ fn refresh_locked(
         let fetched = match provider {
             Provider::Codex => codex::fetch(),
             Provider::Grok => grok::fetch(),
+            Provider::OpenCodeGo => opencode_go::fetch(),
             Provider::Claude => match cache.load(Provider::Claude)? {
                 Some(snapshot) => Ok(snapshot),
                 None => Err(anyhow::anyhow!(

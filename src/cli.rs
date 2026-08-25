@@ -45,6 +45,10 @@ pub enum ProviderSelection {
     Grok,
     Claude,
     Agy,
+    // Derive would split the camel-case name into "open-code-go"; pin it to
+    // the canonical source name with "go" as the short alias.
+    #[value(name = "opencode-go", alias = "go")]
+    OpenCodeGo,
 }
 
 impl ProviderSelection {
@@ -55,6 +59,7 @@ impl ProviderSelection {
             Self::Grok => vec![Provider::Grok],
             Self::Claude => vec![Provider::Claude],
             Self::Agy => vec![Provider::Agy],
+            Self::OpenCodeGo => vec![Provider::OpenCodeGo],
         }
     }
 }
