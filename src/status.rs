@@ -32,6 +32,7 @@ fn status_line(cache: &CacheStore, now_unix: u64) -> Result<String> {
         if let Some(snapshot) = cache.load(provider)? {
             let group = match provider {
                 Provider::OpenCodeGo => open_code_go_segment(&snapshot, now_unix),
+                Provider::Codex => codex_segment(&snapshot, now_unix),
                 _ => segment(&snapshot, now_unix),
             };
             if let Some(segment) = group {
@@ -46,6 +47,26 @@ fn status_line(cache: &CacheStore, now_unix: u64) -> Result<String> {
 /// nothing when the snapshot carries no quota windows at all.
 fn segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
     let window = snapshot.most_consumed_window()?;
+    let label = format!(
+        "{} {}%",
+        snapshot.provider.agent_kind(),
+        format_percent(window.remaining_percent)
+    );
+    let segment = match window.resets_at {
+        Some(reset) => format!("{label} reset {}", format_reset_eta(reset, now_unix)),
+        None => label,
+    };
+    Some(segment)
+}
+
+/// The Codex strip segment tracks the rolling ~5h window — the short-term
+/// limit — falling back to the most-consumed window for caches that predate
+/// the 5h window. The weekly window remains dashboard-popup detail.
+fn codex_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
+    let window = match snapshot.window(WindowKind::FiveHour) {
+        Some(window) => window,
+        None => snapshot.most_consumed_window()?,
+    };
     let label = format!(
         "{} {}%",
         snapshot.provider.agent_kind(),
@@ -154,6 +175,50 @@ mod tests {
             segment(&snapshot, 0).as_deref(),
             Some("claude 10% reset 6d18h")
         );
+    }
+
+    /// The strip tracks Codex's rolling ~5h window; the weekly window is
+    /// dashboard-popup detail.
+    #[test]
+    fn codex_strip_prefers_the_five_hour_window() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let snapshot = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![
+                UsageWindow::new(
+                    WindowKind::FiveHour,
+                    20.0,
+                    Some(ResetAt::from_unix_seconds(156_000)),
+                )
+                .unwrap(),
+                UsageWindow::new(
+                    WindowKind::Weekly,
+                    61.0,
+                    Some(ResetAt::from_unix_seconds(584_000)),
+                )
+                .unwrap(),
+            ],
+            1,
+        );
+        cache.save(&snapshot).unwrap();
+
+        let line = status_line(&cache, 0).unwrap();
+
+        assert_eq!(line, "codex 80% reset 1d19h");
+    }
+
+    #[test]
+    fn codex_strip_falls_back_without_a_five_hour_window() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        cache
+            .save(&weekly_snapshot(Provider::Codex, 61.0, 584_000))
+            .unwrap();
+
+        let line = status_line(&cache, 0).unwrap();
+
+        assert_eq!(line, "codex 39% reset 6d18h");
     }
 
     /// Mirrors the live endpoint contract: rolling 0% used, weekly 0% used,

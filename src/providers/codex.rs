@@ -29,35 +29,58 @@ pub fn parse_rate_limits(
     let objects = [limits.get("primary"), limits.get("secondary")]
         .into_iter()
         .flatten();
-    let weekly = objects
-        .filter_map(|candidate| {
-            let duration = candidate
-                .get("windowDurationMins")
-                .or_else(|| candidate.get("window_duration_mins"))
-                .and_then(Value::as_u64)?;
-            if duration != 10_080 {
-                return None;
-            }
-            let used = candidate
-                .get("usedPercent")
-                .or_else(|| candidate.get("used_percent"))
-                .and_then(Value::as_f64)?;
-            let reset = candidate
-                .get("resetsAt")
-                .or_else(|| candidate.get("resets_at"))
-                .and_then(Value::as_u64)
-                .map(ResetAt::from_unix_seconds);
-            Some((used, reset))
-        })
-        .next()
-        .ok_or_else(|| ProviderError::UnsupportedResponse("no seven-day rate limit".to_string()))?;
-    let window = UsageWindow::new(WindowKind::Weekly, weekly.0, weekly.1)
-        .map_err(|error| ProviderError::UnsupportedResponse(error.to_string()))?;
+    let mut windows = Vec::new();
+    let mut seen_kinds = Vec::new();
+    for candidate in objects {
+        // Windows are identified by their duration, never by their position:
+        // the app-server reports the ~5h primary and the seven-day secondary,
+        // but either can be absent and future tiers must not be misread.
+        let Some(kind) = candidate
+            .get("windowDurationMins")
+            .or_else(|| candidate.get("window_duration_mins"))
+            .and_then(Value::as_u64)
+            .and_then(window_kind_for_duration)
+        else {
+            continue;
+        };
+        let Some(used) = candidate
+            .get("usedPercent")
+            .or_else(|| candidate.get("used_percent"))
+            .and_then(Value::as_f64)
+        else {
+            continue;
+        };
+        let reset = candidate
+            .get("resetsAt")
+            .or_else(|| candidate.get("resets_at"))
+            .and_then(Value::as_u64)
+            .map(ResetAt::from_unix_seconds);
+        let window = UsageWindow::new(kind, used, reset)
+            .map_err(|error| ProviderError::UnsupportedResponse(error.to_string()))?;
+        if seen_kinds.contains(&kind) {
+            continue;
+        }
+        seen_kinds.push(kind);
+        windows.push(window);
+    }
+    if windows.is_empty() {
+        return Err(ProviderError::UnsupportedResponse(
+            "no five-hour or seven-day rate limit".to_string(),
+        ));
+    }
     Ok(ProviderSnapshot::new(
         Provider::Codex,
-        vec![window],
+        windows,
         fetched_at_unix,
     ))
+}
+
+fn window_kind_for_duration(minutes: u64) -> Option<WindowKind> {
+    match minutes {
+        300 => Some(WindowKind::FiveHour),
+        10_080 => Some(WindowKind::Weekly),
+        _ => None,
+    }
 }
 
 pub fn fetch() -> Result<ProviderSnapshot> {
@@ -311,7 +334,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn selects_weekly_codex_window_by_duration_not_position() {
+    fn collects_both_windows_by_duration_not_position() {
         let value = json!({
             "result": {"rateLimits": {
                 "primary": {"usedPercent": 20.0, "windowDurationMins": 300, "resetsAt": 1786795200},
@@ -319,6 +342,25 @@ mod tests {
             }}
         });
         let snapshot = parse_rate_limits(&value, 1).unwrap();
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(
+            snapshot
+                .window(WindowKind::FiveHour)
+                .unwrap()
+                .remaining_percent,
+            80.0
+        );
+        assert_eq!(
+            snapshot
+                .window(WindowKind::Weekly)
+                .unwrap()
+                .remaining_percent,
+            39.0
+        );
+        assert_eq!(
+            snapshot.window(WindowKind::FiveHour).unwrap().resets_at,
+            Some(ResetAt::from_unix_seconds(1_786_795_200))
+        );
         assert_eq!(
             snapshot.window(WindowKind::Weekly).unwrap().resets_at,
             Some(ResetAt::from_unix_seconds(1_787_400_000))
@@ -326,11 +368,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_codex_response_without_seven_day_window() {
+    fn accepts_a_weekly_only_response() {
         let value = json!({"result": {"rateLimits": {
-            "primary": {"usedPercent": 20.0, "windowDurationMins": 300}
+            "secondary": {"usedPercent": 61.0, "windowDurationMins": 10080, "resetsAt": 1787400000}
+        }}});
+        let snapshot = parse_rate_limits(&value, 1).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert!(snapshot.window(WindowKind::Weekly).is_some());
+        assert!(snapshot.window(WindowKind::FiveHour).is_none());
+    }
+
+    #[test]
+    fn accepts_a_five_hour_only_response() {
+        let value = json!({"result": {"rateLimits": {
+            "primary": {"usedPercent": 44.0, "window_duration_mins": 300, "resets_at": 1786795200}
+        }}});
+        let snapshot = parse_rate_limits(&value, 1).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(
+            snapshot
+                .window(WindowKind::FiveHour)
+                .unwrap()
+                .remaining_percent,
+            56.0
+        );
+        assert!(snapshot.window(WindowKind::Weekly).is_none());
+    }
+
+    #[test]
+    fn rejects_codex_response_without_any_known_window() {
+        let value = json!({"result": {"rateLimits": {
+            "primary": {"usedPercent": 20.0, "windowDurationMins": 600}
         }}});
         assert!(parse_rate_limits(&value, 1).is_err());
+
+        let missing = json!({});
+        assert!(parse_rate_limits(&missing, 1).is_err());
     }
 
     #[test]
