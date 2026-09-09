@@ -61,6 +61,8 @@ pub enum ProviderSelection {
     // the canonical source name with "go" as the short alias.
     #[value(name = "opencode-go", alias = "go")]
     OpenCodeGo,
+    #[value(name = "deepseek")]
+    DeepSeek,
 }
 
 impl ProviderSelection {
@@ -72,6 +74,7 @@ impl ProviderSelection {
             Self::Claude => vec![Provider::Claude],
             Self::Agy => vec![Provider::Agy],
             Self::OpenCodeGo => vec![Provider::OpenCodeGo],
+            Self::DeepSeek => vec![Provider::DeepSeek],
         }
     }
 }

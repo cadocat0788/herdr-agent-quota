@@ -29,6 +29,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Polling defaults to 60 seconds and is configurable from 30 seconds to one
   hour. `install.sh` and `uninstall.sh` provide a build/link/configure and
   restore/unlink workflow for downloaded checkouts.
+- Added a read-only DeepSeek balance collector using the configured Pi auth
+  key. Raw USD/CNY balances render with their currency and availability
+  severity instead of fabricated percentage windows.
 
 ### Fixed
 

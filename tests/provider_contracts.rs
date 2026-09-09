@@ -1,5 +1,5 @@
 use herdr_agent_quota::model::{ResetAt, WindowKind};
-use herdr_agent_quota::providers::{agy, claude, codex, grok, opencode_go};
+use herdr_agent_quota::providers::{agy, claude, codex, deepseek, grok, opencode_go};
 use serde_json::Value;
 
 fn fixture(value: &str) -> Value {
@@ -148,4 +148,39 @@ fn opencode_go_rejects_payloads_without_interpretable_windows() {
     assert!(opencode_go::parse_usage_response(&missing, 1).is_err());
     let no_usage = fixture(r#"{"error":{"type":"AuthError"}}"#);
     assert!(opencode_go::parse_usage_response(&no_usage, 1).is_err());
+}
+
+#[test]
+fn deepseek_fixture_caches_raw_usd_balance_without_windows() {
+    let value = fixture(
+        r#"{
+        "is_available": true,
+        "balance_infos": [
+            {"currency":"CNY","total_balance":"28.90","granted_balance":"0.00","topped_up_balance":"28.90"},
+            {"currency":"USD","total_balance":"4.07","granted_balance":"0.00","topped_up_balance":"4.07"}
+        ]
+    }"#,
+    );
+    let snapshot = deepseek::parse_balance_response(&value, 1).unwrap();
+    assert!(snapshot.windows.is_empty());
+    let balance = snapshot.balance.unwrap();
+    assert_eq!(balance.currency, "USD");
+    assert_eq!(balance.total_balance, "4.07");
+    assert!(balance.is_available);
+}
+
+#[test]
+fn deepseek_status_mapping_matches_other_http_collectors() {
+    assert!(matches!(
+        deepseek::error_from_status(401, &fixture(r#"{"error":{"type":"AuthError"}}"#)),
+        herdr_agent_quota::providers::ProviderError::MissingCredentials
+    ));
+    assert!(matches!(
+        deepseek::error_from_status(403, &fixture(r#"{"error":{"message":"forbidden"}}"#)),
+        herdr_agent_quota::providers::ProviderError::Unavailable(message) if message == "forbidden"
+    ));
+    assert!(matches!(
+        deepseek::error_from_status(429, &Value::Null),
+        herdr_agent_quota::providers::ProviderError::Request(message) if message == "HTTP 429"
+    ));
 }

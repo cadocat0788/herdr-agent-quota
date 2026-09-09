@@ -1,6 +1,7 @@
 pub mod agy;
 pub mod claude;
 pub mod codex;
+pub mod deepseek;
 pub mod grok;
 pub mod opencode_go;
 pub mod statusline;

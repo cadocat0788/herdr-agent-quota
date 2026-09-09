@@ -1,6 +1,6 @@
 use crate::cache::CacheStore;
 use crate::model::{Provider, ProviderSnapshot};
-use crate::presentation::dashboard_summary;
+use crate::presentation::{balance_summary, dashboard_summary};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -65,12 +65,17 @@ pub fn render_provider(
     now_unix: u64,
 ) -> String {
     match snapshot {
-        Some(snapshot) => format!(
-            "{} {}\r\n  {}",
-            provider.display_name(),
-            snapshot.severity(now_unix).label(),
-            dashboard_summary(snapshot, now_unix)
-        ),
+        Some(snapshot) => {
+            let status = snapshot.severity(now_unix);
+            let summary =
+                balance_summary(snapshot).unwrap_or_else(|| dashboard_summary(snapshot, now_unix));
+            let indicator = if snapshot.balance.is_some() {
+                status.symbol()
+            } else {
+                status.label()
+            };
+            format!("{} {}\r\n  {}", provider.display_name(), indicator, summary)
+        }
         None => format!("{} N/A\r\n  unavailable", provider.display_name()),
     }
 }

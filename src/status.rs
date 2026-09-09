@@ -1,6 +1,6 @@
 use crate::cache::CacheStore;
 use crate::model::{format_percent, Provider, ProviderSnapshot, WindowKind};
-use crate::presentation::format_reset_eta;
+use crate::presentation::{balance_summary, format_reset_eta};
 use anyhow::Result;
 
 const SEPARATOR: &str = " · ";
@@ -17,6 +17,7 @@ pub fn run() -> Result<()> {
     // refresh is per-provider debounced (60s), swallows every error, and never
     // publishes to panes; the line below still renders whatever the cache holds.
     let _ = crate::refresh::debounced_refresh(Provider::OpenCodeGo);
+    let _ = crate::refresh::debounced_refresh(Provider::DeepSeek);
     let line = CacheStore::from_env()
         .and_then(|cache| status_line(&cache, CacheStore::now_unix()))
         .unwrap_or_default();
@@ -32,6 +33,7 @@ fn status_line(cache: &CacheStore, now_unix: u64) -> Result<String> {
         if let Some(snapshot) = cache.load(provider)? {
             let group = match provider {
                 Provider::OpenCodeGo => open_code_go_segment(&snapshot, now_unix),
+                Provider::DeepSeek => deepseek_segment(&snapshot, now_unix),
                 Provider::Codex => codex_segment(&snapshot, now_unix),
                 _ => segment(&snapshot, now_unix),
             };
@@ -41,6 +43,14 @@ fn status_line(cache: &CacheStore, now_unix: u64) -> Result<String> {
         }
     }
     Ok(segments.join(SEPARATOR))
+}
+
+/// Render a raw DeepSeek balance with a compact label and health symbol.
+/// The status strip shares one line with every other provider, so DeepSeek uses
+/// the short "DSk" marker instead of its full display name to avoid clipping.
+fn deepseek_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
+    let balance = balance_summary(snapshot)?;
+    Some(format!("DSk {} {}", balance, snapshot.severity(now_unix).symbol()))
 }
 
 /// One `<kind> <percent>% reset <eta>` entry for a provider snapshot, or
@@ -95,7 +105,7 @@ fn open_code_go_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ResetAt, UsageWindow, WindowKind};
+    use crate::model::{AccountBalance, ResetAt, UsageWindow, WindowKind};
     use tempfile::tempdir;
 
     fn weekly_snapshot(provider: Provider, used_percent: f64, reset_unix: u64) -> ProviderSnapshot {
@@ -257,6 +267,21 @@ mod tests {
         let line = status_line(&cache, 0).unwrap();
 
         assert_eq!(line, "go 5h 100% reset 9h51m");
+    }
+
+    #[test]
+    fn deepseek_status_uses_raw_balance_and_health_symbol() {
+        let snapshot = ProviderSnapshot::new(Provider::DeepSeek, vec![], 1).with_balance(Some(
+            AccountBalance {
+                currency: "USD".to_string(),
+                total_balance: "4.07".to_string(),
+                is_available: true,
+            },
+        ));
+        assert_eq!(
+            deepseek_segment(&snapshot, 0).as_deref(),
+            Some("DSk 4.07 USD ●")
+        );
     }
 
     #[test]

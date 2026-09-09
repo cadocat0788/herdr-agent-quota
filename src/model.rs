@@ -14,15 +14,17 @@ pub enum Provider {
     // plain lowercase would render the variant as "opencodego".
     #[serde(rename = "opencode-go")]
     OpenCodeGo,
+    DeepSeek,
 }
 
 impl Provider {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Codex,
         Self::Grok,
         Self::Claude,
         Self::Agy,
         Self::OpenCodeGo,
+        Self::DeepSeek,
     ];
 
     pub fn badge(self) -> &'static str {
@@ -32,6 +34,7 @@ impl Provider {
             Self::Claude => "[A]",
             Self::Agy => "[G]",
             Self::OpenCodeGo => "[O]",
+            Self::DeepSeek => "[D]",
         }
     }
 
@@ -44,6 +47,7 @@ impl Provider {
             Self::Claude => "✦Cl",
             Self::Agy => "△Ag",
             Self::OpenCodeGo => "◆Go",
+            Self::DeepSeek => "◇Ds",
         }
     }
 
@@ -54,6 +58,7 @@ impl Provider {
             Self::Claude => "Claude",
             Self::Agy => "Agy",
             Self::OpenCodeGo => "OpenCode Go",
+            Self::DeepSeek => "DeepSeek",
         }
     }
 
@@ -64,6 +69,7 @@ impl Provider {
             Self::Claude => "claude-statusline",
             Self::Agy => "agy-statusline",
             Self::OpenCodeGo => "opencode-go",
+            Self::DeepSeek => "deepseek-api",
         }
     }
 
@@ -76,6 +82,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::Agy => "agy",
             Self::OpenCodeGo => "go",
+            Self::DeepSeek => "deepseek",
         }
     }
 }
@@ -96,6 +103,7 @@ impl Provider {
             // collector feeds only the status strip and dashboard.
             "opencode" => Some(vec![Self::Codex, Self::Grok]),
             "opencode-go" | "go" => Some(vec![Self::OpenCodeGo]),
+            "deepseek" | "deepseek-api" => Some(vec![Self::DeepSeek]),
             _ => None,
         }
     }
@@ -385,6 +393,8 @@ pub struct ProviderSnapshot {
     pub windows: Vec<UsageWindow>,
     #[serde(default)]
     pub context: Option<ContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<AccountBalance>,
     #[serde(default)]
     pub session_summaries: BTreeMap<String, String>,
     /// Login identity the snapshot was fetched for (Grok `user_id`, Codex
@@ -403,6 +413,7 @@ impl ProviderSnapshot {
             fetched_at_unix,
             windows,
             context: None,
+            balance: None,
             session_summaries: BTreeMap::new(),
             account_id: None,
         }
@@ -410,6 +421,11 @@ impl ProviderSnapshot {
 
     pub fn with_context(mut self, context: Option<ContextUsage>) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn with_balance(mut self, balance: Option<AccountBalance>) -> Self {
+        self.balance = balance;
         self
     }
 
@@ -463,11 +479,31 @@ impl ProviderSnapshot {
             // Go reports three independent windows; the binding one is the
             // closest to exhaustion.
             Provider::OpenCodeGo => self.most_consumed_window(),
+            Provider::DeepSeek => {
+                return self
+                    .balance
+                    .as_ref()
+                    .map(|balance| {
+                        if balance.is_available {
+                            Severity::Normal
+                        } else {
+                            Severity::Danger
+                        }
+                    })
+                    .unwrap_or(Severity::Unknown);
+            }
         };
         relevant
             .map(|window| Severity::for_window(window, now_unix))
             .unwrap_or(Severity::Unknown)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountBalance {
+    pub currency: String,
+    pub total_balance: String,
+    pub is_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -51,14 +51,20 @@ impl MetadataTokens {
             quota_status: Severity::Unknown.label().to_string(),
             quota_5h: match provider {
                 Provider::Claude | Provider::Agy | Provider::OpenCodeGo => "5h N/A".to_string(),
-                Provider::Codex | Provider::Grok => String::new(),
+                Provider::Codex | Provider::Grok | Provider::DeepSeek => String::new(),
             },
             quota_5h_severity: match provider {
                 Provider::Claude | Provider::Agy | Provider::OpenCodeGo => Some(Severity::Unknown),
-                Provider::Codex | Provider::Grok => None,
+                Provider::Codex | Provider::Grok | Provider::DeepSeek => None,
             },
-            quota_week: "7d N/A".to_string(),
-            quota_week_severity: Some(Severity::Unknown),
+            quota_week: match provider {
+                Provider::DeepSeek => String::new(),
+                _ => "7d N/A".to_string(),
+            },
+            quota_week_severity: match provider {
+                Provider::DeepSeek => None,
+                _ => Some(Severity::Unknown),
+            },
             quota_summary: "unavailable".to_string(),
             quota_context: String::new(),
             quota_cache: String::new(),
@@ -87,7 +93,17 @@ pub fn dashboard_summary(snapshot: &ProviderSnapshot, now_unix: u64) -> String {
     summary(snapshot, now_unix, true)
 }
 
+pub fn balance_summary(snapshot: &ProviderSnapshot) -> Option<String> {
+    snapshot
+        .balance
+        .as_ref()
+        .map(|balance| format!("{} {}", balance.total_balance, balance.currency))
+}
+
 fn summary(snapshot: &ProviderSnapshot, now_unix: u64, include_left: bool) -> String {
+    if let Some(balance) = balance_summary(snapshot) {
+        return balance;
+    }
     [
         WindowKind::FiveHour,
         WindowKind::Weekly,
