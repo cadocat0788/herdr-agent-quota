@@ -50,11 +50,11 @@ impl MetadataTokens {
             quota_provider: provider.display_name().to_string(),
             quota_status: Severity::Unknown.label().to_string(),
             quota_5h: match provider {
-                Provider::Claude | Provider::Agy | Provider::OpenCodeGo => "5h N/A".to_string(),
+                Provider::Claude | Provider::Agy | Provider::OpenCodeGo | Provider::ZcodeGlm => "5h N/A".to_string(),
                 Provider::Codex | Provider::Grok | Provider::DeepSeek => String::new(),
             },
             quota_5h_severity: match provider {
-                Provider::Claude | Provider::Agy | Provider::OpenCodeGo => Some(Severity::Unknown),
+                Provider::Claude | Provider::Agy | Provider::OpenCodeGo | Provider::ZcodeGlm => Some(Severity::Unknown),
                 Provider::Codex | Provider::Grok | Provider::DeepSeek => None,
             },
             quota_week: match provider {

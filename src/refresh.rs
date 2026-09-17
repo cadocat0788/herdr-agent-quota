@@ -6,7 +6,7 @@ use crate::herdr::{
 use crate::model::{Provider, ProviderSnapshot};
 use crate::presentation::MetadataTokens;
 use crate::providers::statusline::enrich_cache_session;
-use crate::providers::{codex, deepseek, grok, opencode_go};
+use crate::providers::{codex, deepseek, grok, opencode_go, zcode_glm};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -224,6 +224,7 @@ fn refresh_provider(
         Provider::Grok => grok::fetch().map(FetchedSnapshot::direct),
         Provider::OpenCodeGo => opencode_go::fetch().map(FetchedSnapshot::direct),
         Provider::DeepSeek => deepseek::fetch().map(FetchedSnapshot::direct),
+        Provider::ZcodeGlm => zcode_glm::fetch().map(FetchedSnapshot::direct),
         Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
     };
     cache.mark_refresh(provider, now)?;
@@ -300,7 +301,7 @@ fn current_account_gate(provider: Provider) -> (Option<String>, Option<u64>) {
         Provider::Codex => (codex::current_account_id(), codex::auth_mtime_unix()),
         // OpenCodeGo's auth file has no stable account id to gate on yet; its
         // snapshot stays usable across key rotations like Claude/Agy.
-        Provider::OpenCodeGo | Provider::DeepSeek => (None, None),
+        Provider::OpenCodeGo | Provider::DeepSeek | Provider::ZcodeGlm => (None, None),
         Provider::Claude | Provider::Agy => (None, None),
     }
 }

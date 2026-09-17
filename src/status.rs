@@ -18,6 +18,7 @@ pub fn run() -> Result<()> {
     // publishes to panes; the line below still renders whatever the cache holds.
     let _ = crate::refresh::debounced_refresh(Provider::OpenCodeGo);
     let _ = crate::refresh::debounced_refresh(Provider::DeepSeek);
+    let _ = crate::refresh::debounced_refresh(Provider::ZcodeGlm);
     let line = CacheStore::from_env()
         .and_then(|cache| status_line(&cache, CacheStore::now_unix()))
         .unwrap_or_default();
@@ -30,11 +31,15 @@ pub fn run() -> Result<()> {
 fn status_line(cache: &CacheStore, now_unix: u64) -> Result<String> {
     let mut segments = Vec::new();
     for provider in Provider::ALL {
+        if provider == Provider::Grok {
+            continue;
+        }
         if let Some(snapshot) = cache.load(provider)? {
             let group = match provider {
                 Provider::OpenCodeGo => open_code_go_segment(&snapshot, now_unix),
                 Provider::DeepSeek => deepseek_segment(&snapshot, now_unix),
                 Provider::Codex => codex_segment(&snapshot, now_unix),
+                Provider::ZcodeGlm => zcode_glm_segment(&snapshot, now_unix),
                 _ => segment(&snapshot, now_unix),
             };
             if let Some(segment) = group {
@@ -53,6 +58,18 @@ fn deepseek_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String
     Some(format!("DSk {} {}", balance, snapshot.severity(now_unix).symbol()))
 }
 
+/// The GLM strip segment tracks only the rolling ~5h window: the tab bar
+/// clips the full line, so the weekly window stays dashboard-popup detail.
+fn zcode_glm_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
+    let window = snapshot.window(WindowKind::FiveHour)?;
+    let label = format!("glm 5h {}%", format_percent(window.remaining_percent));
+    let segment = match window.resets_at {
+        Some(reset) => format!("{label} → {}", format_reset_eta(reset, now_unix)),
+        None => label,
+    };
+    Some(segment)
+}
+
 /// One `<kind> <percent>% reset <eta>` entry for a provider snapshot, or
 /// nothing when the snapshot carries no quota windows at all.
 fn segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
@@ -63,7 +80,7 @@ fn segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
         format_percent(window.remaining_percent)
     );
     let segment = match window.resets_at {
-        Some(reset) => format!("{label} reset {}", format_reset_eta(reset, now_unix)),
+        Some(reset) => format!("{label} → {}", format_reset_eta(reset, now_unix)),
         None => label,
     };
     Some(segment)
@@ -83,7 +100,7 @@ fn codex_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
         format_percent(window.remaining_percent)
     );
     let segment = match window.resets_at {
-        Some(reset) => format!("{label} reset {}", format_reset_eta(reset, now_unix)),
+        Some(reset) => format!("{label} → {}", format_reset_eta(reset, now_unix)),
         None => label,
     };
     Some(segment)
@@ -96,7 +113,7 @@ fn open_code_go_segment(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<St
     let window = snapshot.window(WindowKind::FiveHour)?;
     let label = format!("go 5h {}%", format_percent(window.remaining_percent));
     let segment = match window.resets_at {
-        Some(reset) => format!("{label} reset {}", format_reset_eta(reset, now_unix)),
+        Some(reset) => format!("{label} → {}", format_reset_eta(reset, now_unix)),
         None => label,
     };
     Some(segment)
@@ -134,7 +151,7 @@ mod tests {
 
         let line = status_line(&cache, 0).unwrap();
 
-        assert_eq!(line, "codex 89% reset 6d18h · grok 96% reset 1d19h");
+            assert_eq!(line, "codex 89% → 6d18h");
     }
 
     #[test]
@@ -147,7 +164,8 @@ mod tests {
 
         let line = status_line(&cache, 0).unwrap();
 
-        assert_eq!(line, "grok 96% reset 1d19h");
+            // Grok is a dashboard-popup detail only; the strip drops it.
+            assert_eq!(line, "");
     }
 
     #[test]
@@ -183,7 +201,7 @@ mod tests {
 
         assert_eq!(
             segment(&snapshot, 0).as_deref(),
-            Some("claude 10% reset 6d18h")
+            Some("claude 10% → 6d18h")
         );
     }
 
@@ -215,7 +233,7 @@ mod tests {
 
         let line = status_line(&cache, 0).unwrap();
 
-        assert_eq!(line, "codex 80% reset 1d19h");
+        assert_eq!(line, "codex 80% → 1d19h");
     }
 
     #[test]
@@ -228,7 +246,7 @@ mod tests {
 
         let line = status_line(&cache, 0).unwrap();
 
-        assert_eq!(line, "codex 39% reset 6d18h");
+        assert_eq!(line, "codex 39% → 6d18h");
     }
 
     /// Mirrors the live endpoint contract: rolling 0% used, weekly 0% used,
@@ -266,7 +284,7 @@ mod tests {
 
         let line = status_line(&cache, 0).unwrap();
 
-        assert_eq!(line, "go 5h 100% reset 9h51m");
+        assert_eq!(line, "go 5h 100% → 9h51m");
     }
 
     #[test]
@@ -305,5 +323,46 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(status_line(&cache, 0).unwrap(), "go 5h 100%");
+    }
+
+    /// The strip tracks GLM's rolling ~5h window only; the weekly window is
+    /// dashboard-popup detail and Grok never appears.
+    #[test]
+    fn glm_strip_shows_only_the_five_hour_window() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let snapshot = ProviderSnapshot::new(
+            Provider::ZcodeGlm,
+            vec![
+                UsageWindow::new(
+                    WindowKind::FiveHour,
+                    16.0,
+                    Some(ResetAt::from_unix_seconds(11_400)),
+                )
+                .unwrap(),
+                UsageWindow::new(
+                    WindowKind::Weekly,
+                    3.0,
+                    Some(ResetAt::from_unix_seconds(434_400)),
+                )
+                .unwrap(),
+            ],
+            1,
+        );
+        cache.save(&snapshot).unwrap();
+
+        let line = status_line(&cache, 0).unwrap();
+
+        assert_eq!(line, "glm 5h 84% → 3h10m");
+    }
+
+    #[test]
+    fn glm_strip_skipped_without_both_windows() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        cache
+            .save(&weekly_snapshot(Provider::ZcodeGlm, 3.0, 434_400))
+            .unwrap();
+        assert_eq!(status_line(&cache, 0).unwrap(), "");
     }
 }

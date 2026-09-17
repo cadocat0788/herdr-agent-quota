@@ -63,6 +63,8 @@ pub enum ProviderSelection {
     OpenCodeGo,
     #[value(name = "deepseek")]
     DeepSeek,
+    #[value(name = "zcode-glm", alias = "glm")]
+    ZcodeGlm,
 }
 
 impl ProviderSelection {
@@ -75,6 +77,7 @@ impl ProviderSelection {
             Self::Agy => vec![Provider::Agy],
             Self::OpenCodeGo => vec![Provider::OpenCodeGo],
             Self::DeepSeek => vec![Provider::DeepSeek],
+            Self::ZcodeGlm => vec![Provider::ZcodeGlm],
         }
     }
 }

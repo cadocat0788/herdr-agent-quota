@@ -15,16 +15,21 @@ pub enum Provider {
     #[serde(rename = "opencode-go")]
     OpenCodeGo,
     DeepSeek,
+    // Keep the cached snapshot's provider field consistent with source();
+    // plain lowercase would render the variant as "zcodeglm".
+    #[serde(rename = "zcode-glm")]
+    ZcodeGlm,
 }
 
 impl Provider {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Codex,
         Self::Grok,
         Self::Claude,
         Self::Agy,
         Self::OpenCodeGo,
         Self::DeepSeek,
+        Self::ZcodeGlm,
     ];
 
     pub fn badge(self) -> &'static str {
@@ -35,6 +40,7 @@ impl Provider {
             Self::Agy => "[G]",
             Self::OpenCodeGo => "[O]",
             Self::DeepSeek => "[D]",
+            Self::ZcodeGlm => "[Z]",
         }
     }
 
@@ -48,6 +54,7 @@ impl Provider {
             Self::Agy => "△Ag",
             Self::OpenCodeGo => "◆Go",
             Self::DeepSeek => "◇Ds",
+            Self::ZcodeGlm => "◆Z",
         }
     }
 
@@ -59,6 +66,7 @@ impl Provider {
             Self::Agy => "Agy",
             Self::OpenCodeGo => "OpenCode Go",
             Self::DeepSeek => "DeepSeek",
+            Self::ZcodeGlm => "Zcode GLM",
         }
     }
 
@@ -70,6 +78,7 @@ impl Provider {
             Self::Agy => "agy-statusline",
             Self::OpenCodeGo => "opencode-go",
             Self::DeepSeek => "deepseek-api",
+            Self::ZcodeGlm => "zcode-glm",
         }
     }
 
@@ -83,6 +92,7 @@ impl Provider {
             Self::Agy => "agy",
             Self::OpenCodeGo => "go",
             Self::DeepSeek => "deepseek",
+            Self::ZcodeGlm => "glm",
         }
     }
 }
@@ -104,6 +114,7 @@ impl Provider {
             "opencode" => Some(vec![Self::Codex, Self::Grok]),
             "opencode-go" | "go" => Some(vec![Self::OpenCodeGo]),
             "deepseek" | "deepseek-api" => Some(vec![Self::DeepSeek]),
+            "zcode" | "zcode-glm" | "glm" => Some(vec![Self::ZcodeGlm]),
             _ => None,
         }
     }
@@ -476,9 +487,9 @@ impl ProviderSnapshot {
             Provider::Claude | Provider::Agy => self
                 .window(WindowKind::FiveHour)
                 .or_else(|| self.window(WindowKind::Weekly)),
-            // Go reports three independent windows; the binding one is the
+            // Go and GLM report independent windows; the binding one is the
             // closest to exhaustion.
-            Provider::OpenCodeGo => self.most_consumed_window(),
+            Provider::OpenCodeGo | Provider::ZcodeGlm => self.most_consumed_window(),
             Provider::DeepSeek => {
                 return self
                     .balance

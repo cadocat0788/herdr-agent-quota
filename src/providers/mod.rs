@@ -5,10 +5,11 @@ pub mod deepseek;
 pub mod grok;
 pub mod opencode_go;
 pub mod statusline;
+pub mod zcode_glm;
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 pub enum ProviderError {
     #[error("provider credentials are unavailable")]
     MissingCredentials,
