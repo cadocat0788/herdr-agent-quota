@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `configure --apply` now installs the global quota surfaces itself: the tab-bar
+  status strip (`[ui] tab_bar_right` with the `status` subcommand) and the
+  `prefix+u` dashboard popup. Re-running is idempotent, unrelated
+  `tab_bar_right` entries and keybindings are preserved, and applying migrates
+  quota rows an older version wrote into `[ui.sidebar]` away — so a fresh
+  installation reproduces the strip-only layout without hand-editing
+  `~/.config/herdr/config.toml`, and no version writes sidebar rows again
+  (uninstall still removes the rows older ones left).
+- DeepSeek and Zcode GLM now resolve Pi's auth store through one shared helper:
+  the provider's own env override, `$PI_CODING_AGENT_DIR/auth.json`,
+  `~/.pi/agent/auth.json`, then `~/.gentle-shell/agent/auth.json` — the store Pi
+  writes when it runs under Gentle Shell. A store that exists without the
+  provider's entry no longer hides a later one.
 - Context now follows the provider name, while cache diagnostics use two
   dedicated rows: a one-decimal cumulative session hit rate and the elapsed
   time since the latest cache-bearing response plus an explicitly approximate

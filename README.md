@@ -174,17 +174,25 @@ long turns no longer start one refresh command per tool call.
 
 ## Optional: global status strip and quota dashboard
 
-The sidebar cards are per-pane. Two global surfaces are available but **not**
-enabled by the installer, because they touch `[ui]` and keybindings that belong
-to the user:
+The sidebar cards are per-pane. Two global surfaces sit above them:
 
 1. **Status strip** (tab bar, bottom): one line summarizing every subscription,
    rendered by the `status` subcommand.
-2. **Quota dashboard popup**: the `dashboard` subcommand in a popup; the usual
-   binding is `prefix+u`.
+2. **Quota dashboard popup**: the `dashboard` subcommand in a popup, bound to
+   `prefix+u`.
 
-To enable both, add to `~/.config/herdr/config.toml` (adjust the binary path to
-your checkout):
+`herdr-agent-quota.configure` (the **Install / repair agent quota** action, or
+`configure --apply`) enables both: it writes the strip entry into
+`[ui] tab_bar_right`, sets `[ui] tab_bar_position = "bottom"` when that key is
+absent, adds the `prefix+u` popup binding, and keeps the `prefix+shift+r`
+refresh binding. Re-running it is idempotent, unrelated `tab_bar_right` entries
+and other `[[keys.command]]` entries are left alone, and it writes **no**
+`[ui.sidebar]` rows: the quota surface is the strip, not the sidebar.
+`configure --uninstall` removes exactly what it added and still cleans sidebar
+rows written by older versions.
+
+A manual entry is only needed when the plugin must be driven from a custom
+binary or state path:
 
 ```toml
 [ui]
@@ -203,8 +211,8 @@ height = "60%"
 ```
 
 `<plugin-state-dir>` is Herdr's plugin state directory for this plugin
-(`~/.local/state/herdr/plugins/herdr-agent-quota` by default on Linux); the
-custom keybinding command does not receive `HERDR_PLUGIN_STATE_DIR`
+(`~/.local/state/herdr/plugins/herdr-agent-quota` by default on Linux); a
+hand-written keybinding command does not receive `HERDR_PLUGIN_STATE_DIR`
 automatically, so it must be set explicitly in the command string. Reload with
 `herdr server reload-config`.
 
@@ -232,6 +240,15 @@ windows; press `r` inside to force-refresh, `q`/`Esc` to close.
 Versions above were checked on the development machine on 2026-08-15. The
 parser follows the provider fields rather than hard-coding these version
 strings, so newer compatible CLI releases can continue to work.
+
+Providers that read Pi's auth store — Zcode GLM (`zai-coding-cn`) and DeepSeek
+(`deepseek`) — resolve it in this order, taking the first store that actually
+has their entry: the provider's own env override (`ZCODE_GLM_AUTH_FILE` for
+Zcode GLM), `$PI_CODING_AGENT_DIR/auth.json`, `~/.pi/agent/auth.json`, then
+`~/.gentle-shell/agent/auth.json`. That last path is the store Pi writes when it
+runs under Gentle Shell, where the plain `~/.pi/agent` one does not exist. A
+missing, unreadable, or unparsable store is skipped silently, so the provider
+simply contributes no segment instead of failing the strip.
 
 The sidebar shows **percentage remaining** and the time until each quota reset,
 not quota token counts. The two Claude windows use compact `5h` and `7d`

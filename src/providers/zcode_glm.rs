@@ -1,6 +1,6 @@
 use crate::cache::CacheStore;
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
-use crate::providers::ProviderError;
+use crate::providers::{find_in_auth_stores, ProviderError};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -23,8 +23,13 @@ pub struct ZcodeGlmCredentials {
 }
 
 pub fn fetch() -> Result<ProviderSnapshot> {
-    let path = auth_path().context("resolve Zcode GLM auth path")?;
-    let credentials = read_credentials(&path).map_err(anyhow::Error::from)?;
+    let credentials = match find_in_auth_stores(Some("ZCODE_GLM_AUTH_FILE"), find_key) {
+        Some((_, credentials)) => credentials,
+        None => {
+            let path = auth_path().context("resolve Zcode GLM auth path")?;
+            read_credentials(&path).map_err(anyhow::Error::from)?
+        }
+    };
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(10))
@@ -51,16 +56,19 @@ pub fn fetch() -> Result<ProviderSnapshot> {
     }
 }
 
-/// `ZCODE_GLM_AUTH_FILE` override, else Pi's auth store `~/.pi/agent/auth.json`.
+/// `ZCODE_GLM_AUTH_FILE` first, then Pi's auth stores in precedence order: the
+/// shared `~/.pi/agent` one, then Gentle Shell's isolated home, which is where
+/// Pi writes its store when it runs under Gentle Shell.
 pub fn auth_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ZCODE_GLM_AUTH_FILE") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".pi")
-        .join("agent")
-        .join("auth.json"))
+    let candidates = crate::providers::auth_store_candidates(Some("ZCODE_GLM_AUTH_FILE"));
+    let fallback = candidates
+        .last()
+        .cloned()
+        .context("no auth store candidate")?;
+    Ok(candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or(fallback))
 }
 
 pub fn read_credentials(path: &Path) -> std::result::Result<ZcodeGlmCredentials, ProviderError> {

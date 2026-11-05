@@ -1,6 +1,6 @@
 use crate::cache::CacheStore;
 use crate::model::{AccountBalance, Provider, ProviderSnapshot};
-use crate::providers::ProviderError;
+use crate::providers::{find_in_auth_stores, ProviderError};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -16,8 +16,13 @@ pub struct DeepSeekCredentials {
 }
 
 pub fn fetch() -> Result<ProviderSnapshot> {
-    let path = auth_path().context("resolve DeepSeek auth path")?;
-    let credentials = read_credentials(&path).map_err(anyhow::Error::from)?;
+    let credentials = match find_in_auth_stores(None, find_key) {
+        Some((_, credentials)) => credentials,
+        None => {
+            let path = auth_path().context("resolve DeepSeek auth path")?;
+            read_credentials(&path).map_err(anyhow::Error::from)?
+        }
+    };
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(10))
@@ -45,12 +50,19 @@ pub fn fetch() -> Result<ProviderSnapshot> {
     }
 }
 
+/// Every auth store this provider can read, in precedence order; the first one
+/// that exists wins, and the isolated Gentle Shell home is the fallback a
+/// plain-`~/.pi` install never has.
 pub fn auth_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".pi")
-        .join("agent")
-        .join("auth.json"))
+    let candidates = crate::providers::auth_store_candidates(None);
+    let fallback = candidates
+        .last()
+        .cloned()
+        .context("no auth store candidate")?;
+    Ok(candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or(fallback))
 }
 
 pub fn read_credentials(path: &Path) -> std::result::Result<DeepSeekCredentials, ProviderError> {

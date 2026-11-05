@@ -33,6 +33,11 @@ const PROVIDER_STYLE_MARKER: &str = "herdr-agent-quota-provider";
 const REFRESH_KEY: &str = "prefix+shift+r";
 const REFRESH_ACTION: &str = "herdr-agent-quota.refresh";
 const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
+const DASHBOARD_KEY: &str = "prefix+u";
+const PLUGIN_BINARY: &str = "herdr-agent-quota";
+const DEFAULT_STATE_DIR: &str = ".local/state/herdr/plugins/herdr-agent-quota";
+const STRIP_INTERVAL_SECONDS: i64 = 30;
+const STRIP_TIMEOUT_SECONDS: i64 = 5;
 const QUOTA_SAFE_COLOR: &str = "#84b084";
 const QUOTA_WARNING_COLOR: &str = "#cdaa65";
 const QUOTA_DANGER_COLOR: &str = "#ca6470";
@@ -53,14 +58,14 @@ const PROVIDER_STYLES: [(&str, Option<&str>); 5] = [
 pub fn check() -> Result<()> {
     let path = config_path()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
-    let updated = add_quota_row(&original)?;
+    let updated = add_status_strip(&original)?;
     if updated == original {
         println!(
-            "Herdr sidebar already contains quota tokens: {}",
+            "Herdr status strip is already configured: {}",
             path.display()
         );
     } else {
-        println!("Herdr sidebar preview for {}:", path.display());
+        println!("Herdr status strip preview for {}:", path.display());
         print_diff_hint();
     }
     Ok(())
@@ -70,7 +75,7 @@ pub fn apply() -> Result<()> {
     let path = config_path()?;
     let existed = path.exists();
     let original = fs::read_to_string(&path).unwrap_or_default();
-    let updated = add_quota_row(&original)?;
+    let updated = add_status_strip(&original)?;
     if updated == original {
         return Ok(());
     }
@@ -81,7 +86,7 @@ pub fn apply() -> Result<()> {
         fs::create_dir_all(parent).context("create Herdr config directory")?;
     }
     fs::write(&path, updated).context("write Herdr config")?;
-    println!("Added quota sidebar row to {}", path.display());
+    println!("Added the quota status strip to {}", path.display());
     Ok(())
 }
 
@@ -89,19 +94,21 @@ pub fn uninstall() -> Result<()> {
     let path = config_path()?;
     if path.exists() {
         let original = fs::read_to_string(&path).context("read Herdr config")?;
-        let updated = reversible_backup(&original)?.unwrap_or(remove_quota_row(&original)?);
+        let updated = match reversible_backup(&original)? {
+            Some(restored) => restored,
+            // No backup, or the config drifted since apply: drop our strip and
+            // any sidebar rows an older version wrote.
+            None => remove_status_strip(&remove_quota_row(&original)?)?,
+        };
         let originally_absent = backup_presence_path()?
             .and_then(|path| fs::read_to_string(path).ok())
             .is_some_and(|value| value.trim() == "absent");
         if originally_absent && updated.is_empty() {
             fs::remove_file(&path).context("remove empty Herdr config")?;
-            println!(
-                "Removed quota sidebar configuration from {}",
-                path.display()
-            );
+            println!("Removed quota configuration from {}", path.display());
         } else if updated != original {
             fs::write(&path, updated).context("remove quota sidebar row")?;
-            println!("Removed quota sidebar row from {}", path.display());
+            println!("Removed quota configuration from {}", path.display());
         }
     }
     if let Some(backup) = backup_path()? {
@@ -158,12 +165,13 @@ fn reversible_backup(current: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let original = fs::read_to_string(&path).context("read Herdr config backup")?;
-    if add_quota_row(&original)? == current {
+    if add_status_strip(&original)? == current {
         return Ok(Some(original));
     }
     Ok(None)
 }
 
+/// Legacy writer: `configure --apply` no longer calls it.
 pub fn add_quota_row(input: &str) -> Result<String> {
     let mut document = if input.trim().is_empty() {
         DocumentMut::new()
@@ -299,6 +307,227 @@ fn remove_refresh_keybinding(document: &mut DocumentMut) {
     let mut retained = ArrayOfTables::new();
     for command in commands.iter() {
         if command.get("command").and_then(Item::as_str) != Some(REFRESH_ACTION) {
+            retained.push(command.clone());
+        }
+    }
+    if retained.is_empty() {
+        keys.remove("command");
+    } else {
+        keys["command"] = Item::ArrayOfTables(retained);
+    }
+    if keys.is_empty() {
+        document.remove("keys");
+    }
+}
+
+/// The plugin root Herdr runs this plugin from: the action environment first,
+/// then the running binary's own `target/release` layout, so a manual run and
+/// a Herdr action resolve the same paths.
+fn plugin_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("HERDR_PLUGIN_ROOT") {
+        if !root.is_empty() {
+            return Ok(PathBuf::from(root));
+        }
+    }
+    let executable = std::env::current_exe().context("resolve plugin executable")?;
+    Ok(executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or(executable))
+}
+
+/// The state directory the strip command reads its cache from.
+fn plugin_state_dir() -> Result<PathBuf> {
+    if let Some(directory) = std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
+        if !directory.is_empty() {
+            return Ok(PathBuf::from(directory));
+        }
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(DEFAULT_STATE_DIR))
+}
+
+fn strip_command(plugin_root: &Path, state_dir: &Path) -> String {
+    format!(
+        "HERDR_PLUGIN_STATE_DIR='{}' {}/target/release/{PLUGIN_BINARY} status",
+        state_dir.display(),
+        plugin_root.display()
+    )
+}
+
+fn dashboard_command(plugin_root: &Path, state_dir: &Path) -> String {
+    format!(
+        "HERDR_PLUGIN_STATE_DIR='{}' {}/target/release/{PLUGIN_BINARY} dashboard",
+        state_dir.display(),
+        plugin_root.display()
+    )
+}
+
+fn strip_entry(plugin_root: &Path, state_dir: &Path) -> Value {
+    let mut entry = InlineTable::new();
+    entry.insert("type", Value::from("command"));
+    entry.insert("command", Value::from(strip_command(plugin_root, state_dir)));
+    entry.insert("interval_seconds", Value::from(STRIP_INTERVAL_SECONDS));
+    entry.insert("timeout_seconds", Value::from(STRIP_TIMEOUT_SECONDS));
+    Value::InlineTable(entry)
+}
+
+fn entry_command(entry: &Value) -> Option<&str> {
+    entry
+        .as_inline_table()
+        .and_then(|table| table.get("command"))
+        .and_then(Value::as_str)
+}
+
+/// A `tab_bar_right` entry this plugin owns, whatever path or state directory
+/// an earlier install baked into it.
+fn is_strip_entry(entry: &Value) -> bool {
+    entry_command(entry).is_some_and(|command| {
+        command.contains(PLUGIN_BINARY) && command.trim_end().ends_with("status")
+    })
+}
+
+pub fn add_status_strip(input: &str) -> Result<String> {
+    add_status_strip_for(input, &plugin_root()?, &plugin_state_dir()?)
+}
+
+/// `configure --apply`: the global status strip and its dashboard binding.
+///
+/// The strip replaces any entry this plugin wrote before, keeps every other
+/// `tab_bar_right` entry and keybinding untouched, and never writes sidebar
+/// rows; `remove_quota_row` is what cleans the rows older versions wrote.
+pub fn add_status_strip_for(input: &str, plugin_root: &Path, state_dir: &Path) -> Result<String> {
+    // Older versions wrote sidebar rows. The strip replaces that surface, so
+    // applying migrates them away; `uninstall` restores them from the backup.
+    // Only a config that still carries the legacy tokens is cleaned, so a
+    // second apply leaves keybindings in the order the first one wrote them.
+    let input = if QUOTA_ROW_MARKERS.iter().any(|marker| input.contains(marker)) {
+        remove_quota_row(input)?
+    } else {
+        input.to_string()
+    };
+    let mut document = if input.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        input
+            .parse::<DocumentMut>()
+            .context("parse Herdr TOML config")?
+    };
+    add_refresh_keybinding(&mut document)?;
+    add_dashboard_keybinding(&mut document, plugin_root, state_dir)?;
+    let ui = ensure_table(&mut document, &["ui"])?;
+    if !ui.contains_key("tab_bar_position") {
+        ui.insert("tab_bar_position", Item::Value(Value::from("bottom")));
+    }
+    let entries = ui
+        .entry("tab_bar_right")
+        .or_insert_with(|| Item::Value(Value::Array(Array::new())));
+    let entries = entries
+        .as_array_mut()
+        .context("Herdr ui.tab_bar_right must be an array")?;
+    let ours = strip_entry(plugin_root, state_dir);
+    let mut retained = Array::new();
+    let mut replaced = false;
+    for entry in entries.iter() {
+        if is_strip_entry(entry) {
+            if !replaced {
+                retained.push(ours.clone());
+                replaced = true;
+            }
+            continue;
+        }
+        retained.push(entry.clone());
+    }
+    if !replaced {
+        retained.push(ours);
+    }
+    *entries = retained;
+    Ok(document.to_string())
+}
+
+/// Remove the strip and dashboard binding this plugin owns, leaving anything
+/// the user added to `tab_bar_right` or `keys.command` alone.
+pub fn remove_status_strip(input: &str) -> Result<String> {
+    if input.trim().is_empty() {
+        return Ok(input.to_string());
+    }
+    let mut document = input
+        .parse::<DocumentMut>()
+        .context("parse Herdr TOML config")?;
+    remove_refresh_keybinding(&mut document);
+    remove_dashboard_keybinding(&mut document);
+    let Some(ui) = document.get_mut("ui").and_then(Item::as_table_mut) else {
+        return Ok(document.to_string());
+    };
+    if let Some(entries) = ui.get_mut("tab_bar_right").and_then(Item::as_array_mut) {
+        let mut retained = Array::new();
+        for entry in entries.iter() {
+            if !is_strip_entry(entry) {
+                retained.push(entry.clone());
+            }
+        }
+        if retained.is_empty() {
+            ui.remove("tab_bar_right");
+        } else {
+            ui["tab_bar_right"] = Item::Value(Value::Array(retained));
+        }
+    }
+    Ok(document.to_string())
+}
+
+fn add_dashboard_keybinding(
+    document: &mut DocumentMut,
+    plugin_root: &Path,
+    state_dir: &Path,
+) -> Result<()> {
+    let keys = ensure_table(document, &["keys"])?;
+    let commands = keys
+        .entry("command")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("Herdr keys.command must be an array of tables")?;
+    if commands
+        .iter()
+        .any(|command| command.get("key").and_then(Item::as_str) == Some(DASHBOARD_KEY))
+    {
+        return Ok(());
+    }
+    let mut command = Table::new();
+    command.insert("key", Item::Value(Value::from(DASHBOARD_KEY)));
+    command.insert("type", Item::Value(Value::from("popup")));
+    command.insert(
+        "command",
+        Item::Value(Value::from(dashboard_command(plugin_root, state_dir))),
+    );
+    command.insert("description", Item::Value(Value::from("quota dashboard")));
+    command.insert("width", Item::Value(Value::from("60%")));
+    command.insert("height", Item::Value(Value::from("60%")));
+    commands.push(command);
+    Ok(())
+}
+
+fn remove_dashboard_keybinding(document: &mut DocumentMut) {
+    let Some(keys) = document.get_mut("keys").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let Some(commands) = keys
+        .get_mut("command")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    let mut retained = ArrayOfTables::new();
+    for command in commands.iter() {
+        let is_ours = command.get("key").and_then(Item::as_str) == Some(DASHBOARD_KEY)
+            && command
+                .get("command")
+                .and_then(Item::as_str)
+                .is_some_and(|value| {
+                    value.contains(PLUGIN_BINARY) && value.trim_end().ends_with("dashboard")
+                });
+        if !is_ours {
             retained.push(command.clone());
         }
     }
@@ -720,5 +949,70 @@ claude = [["state_icon", "agent"]]
     fn empty_sidebar_configuration_round_trips_to_empty() {
         let updated = add_quota_row("").unwrap();
         assert_eq!(remove_quota_row(&updated).unwrap(), "");
+    }
+
+    #[test]
+    fn writes_the_status_strip_and_the_dashboard_binding() {
+        let root = Path::new("/opt/herdr-agent-quota");
+        let state = Path::new("/var/state/herdr-agent-quota");
+        let updated = add_status_strip_for("", root, state).unwrap();
+        assert!(updated.contains("tab_bar_position = \"bottom\""));
+        assert!(updated.contains("/opt/herdr-agent-quota/target/release/herdr-agent-quota status"));
+        assert!(updated.contains("interval_seconds = 30"));
+        assert!(updated.contains("timeout_seconds = 5"));
+        assert!(updated.contains("key = \"prefix+u\""));
+        assert!(updated.contains("/opt/herdr-agent-quota/target/release/herdr-agent-quota dashboard"));
+        assert!(updated.contains("key = \"prefix+shift+r\""));
+    }
+
+    #[test]
+    fn applying_the_status_strip_never_writes_sidebar_rows() {
+        let updated =
+            add_status_strip_for("", Path::new("/opt/p"), Path::new("/var/s")).unwrap();
+        assert!(!updated.contains("$quota_"));
+        assert!(!updated.contains("[ui.sidebar"));
+    }
+
+    #[test]
+    fn applying_the_strip_migrates_legacy_sidebar_rows_away() {
+        let with_legacy = add_quota_row("").unwrap();
+        assert!(with_legacy.contains("$quota_"));
+        let migrated = add_status_strip_for(&with_legacy, Path::new("/opt/p"), Path::new("/var/s"))
+            .unwrap();
+        assert!(!migrated.contains("$quota_"));
+        assert!(migrated.contains("tab_bar_right"));
+    }
+
+    #[test]
+    fn re_applying_the_status_strip_is_idempotent() {
+        let root = Path::new("/opt/p");
+        let state = Path::new("/var/s");
+        let once = add_status_strip_for("", root, state).unwrap();
+        let twice = add_status_strip_for(&once, root, state).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches("type = \"command\"").count(), 1);
+    }
+
+    #[test]
+    fn the_status_strip_preserves_other_entries_and_keys() {
+        let config = "[ui]\ntab_bar_right = [{ type = \"text\", text = \"mine\" }]\n\n[[keys.command]]\nkey = \"prefix+n\"\ntype = \"shell\"\ncommand = \"echo hi\"\n";
+        let updated =
+            add_status_strip_for(config, Path::new("/opt/p"), Path::new("/var/s")).unwrap();
+        assert!(updated.contains("mine"));
+        assert!(updated.contains("prefix+n"));
+        assert_eq!(updated.matches("type = \"command\"").count(), 1);
+    }
+
+    #[test]
+    fn uninstall_removes_the_strip_binding_and_legacy_sidebar_rows() {
+        let root = Path::new("/opt/p");
+        let state = Path::new("/var/s");
+        let with_strip = add_status_strip_for("", root, state).unwrap();
+        let with_legacy_rows = add_quota_row(&with_strip).unwrap();
+        let cleaned = remove_status_strip(&remove_quota_row(&with_legacy_rows).unwrap()).unwrap();
+        assert!(!cleaned.contains("tab_bar_right"));
+        assert!(!cleaned.contains("prefix+u"));
+        assert!(!cleaned.contains("prefix+shift+r"));
+        assert!(!cleaned.contains("$quota_"));
     }
 }

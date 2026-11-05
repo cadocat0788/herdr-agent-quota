@@ -552,7 +552,7 @@ fn opencode_event_publishes_both_subscription_windows_without_reading_the_pane()
 }
 
 #[test]
-fn configure_writes_and_removes_a_managed_opencode_sidebar_entry() {
+fn configure_writes_and_removes_the_status_strip_without_touching_the_sidebar() {
     let state = tempdir().unwrap();
     let config = state.path().join("config.toml");
     let claude_settings = state.path().join("claude-settings.json");
@@ -567,26 +567,31 @@ fn configure_writes_and_removes_a_managed_opencode_sidebar_entry() {
             .env("AGY_SETTINGS_FILE", &agy_settings)
             .env("GROK_HOME", state.path().join("grok"));
     };
+    let user_rows = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]\n";
 
-    fs::write(
-        &config,
-        "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]\n",
-    )
-    .unwrap();
+    fs::write(&config, user_rows).unwrap();
 
     let mut applied = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
     isolated(&mut applied);
     let applied = applied.arg("configure").arg("--apply").output().unwrap();
     assert!(applied.status.success());
     let content = fs::read_to_string(&config).unwrap();
-    assert!(content.contains("[ui.sidebar.agents.rows_by_agent]"));
-    assert!(content.contains("opencode = [["));
-    assert!(content.contains("#7a9e7e"));
-    assert_eq!(
-        add_quota_row(&content).unwrap(),
-        content,
-        "applying again must be idempotent"
-    );
+    // The global surface is the tab-bar strip, not a sidebar row.
+    assert!(content.contains("tab_bar_right"));
+    assert!(content.contains("herdr-agent-quota status"));
+    assert!(content.contains("tab_bar_position = \"bottom\""));
+    assert!(content.contains("key = \"prefix+u\""));
+    assert!(!content.contains("rows_by_agent"));
+    assert!(!content.contains("$quota_"));
+    // The user's own rows survive applying.
+    assert!(content.contains("[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]"));
+
+    // Applying twice must not duplicate the strip or the binding.
+    let mut again = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+    isolated(&mut again);
+    let again = again.arg("configure").arg("--apply").output().unwrap();
+    assert!(again.status.success());
+    assert_eq!(fs::read_to_string(&config).unwrap(), content);
 
     let mut removed = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
     isolated(&mut removed);
@@ -597,7 +602,8 @@ fn configure_writes_and_removes_a_managed_opencode_sidebar_entry() {
         .unwrap();
     assert!(removed.status.success());
     let restored = fs::read_to_string(&config).unwrap();
-    assert!(!restored.contains("opencode = [["));
-    // Upstream restores the user's rows verbatim from the backup.
+    assert!(!restored.contains("tab_bar_right"));
+    assert!(!restored.contains("prefix+u"));
+    // Upstream restores the user's config verbatim from the backup.
     assert!(restored.contains("[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]"));
 }
