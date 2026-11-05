@@ -10,10 +10,27 @@ pub enum Provider {
     Grok,
     Claude,
     Agy,
+    // Keep the cached snapshot's provider field consistent with source();
+    // plain lowercase would render the variant as "opencodego".
+    #[serde(rename = "opencode-go")]
+    OpenCodeGo,
+    DeepSeek,
+    // Keep the cached snapshot's provider field consistent with source();
+    // plain lowercase would render the variant as "zcodeglm".
+    #[serde(rename = "zcode-glm")]
+    ZcodeGlm,
 }
 
 impl Provider {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::Grok, Self::Claude, Self::Agy];
+    pub const ALL: [Self; 7] = [
+        Self::Codex,
+        Self::Grok,
+        Self::Claude,
+        Self::Agy,
+        Self::OpenCodeGo,
+        Self::DeepSeek,
+        Self::ZcodeGlm,
+    ];
 
     pub fn badge(self) -> &'static str {
         match self {
@@ -21,6 +38,9 @@ impl Provider {
             Self::Grok => "[X]",
             Self::Claude => "[A]",
             Self::Agy => "[G]",
+            Self::OpenCodeGo => "[O]",
+            Self::DeepSeek => "[D]",
+            Self::ZcodeGlm => "[Z]",
         }
     }
 
@@ -32,6 +52,9 @@ impl Provider {
             Self::Grok => "✕G",
             Self::Claude => "✦Cl",
             Self::Agy => "△Ag",
+            Self::OpenCodeGo => "◆Go",
+            Self::DeepSeek => "◇Ds",
+            Self::ZcodeGlm => "◆Z",
         }
     }
 
@@ -41,6 +64,9 @@ impl Provider {
             Self::Grok => "Grok",
             Self::Claude => "Claude",
             Self::Agy => "Agy",
+            Self::OpenCodeGo => "OpenCode Go",
+            Self::DeepSeek => "DeepSeek",
+            Self::ZcodeGlm => "Zcode GLM",
         }
     }
 
@@ -50,6 +76,46 @@ impl Provider {
             Self::Grok => "grok-cli-billing",
             Self::Claude => "claude-statusline",
             Self::Agy => "agy-statusline",
+            Self::OpenCodeGo => "opencode-go",
+            Self::DeepSeek => "deepseek-api",
+            Self::ZcodeGlm => "zcode-glm",
+        }
+    }
+
+    /// Lowercase Herdr agent-kind name for this data source, used to label
+    /// window rows on cards fed by several providers.
+    pub fn agent_kind(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Claude => "claude",
+            Self::Agy => "agy",
+            Self::OpenCodeGo => "go",
+            Self::DeepSeek => "deepseek",
+            Self::ZcodeGlm => "glm",
+        }
+    }
+}
+
+impl Provider {
+    /// Single mapping from Herdr's agent kind to the data sources that feed
+    /// one of its cards. Most kinds map to exactly one provider; an agent
+    /// kind like `opencode` runs several agents, so its card is fed by every
+    /// subscription those agents consume.
+    pub fn providers_for_agent(kind: &str) -> Option<Vec<Self>> {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some(vec![Self::Codex]),
+            "grok" => Some(vec![Self::Grok]),
+            "claude" | "claude-code" | "anthropic" => Some(vec![Self::Claude]),
+            "agy" | "antigravity" | "antigravity-cli" => Some(vec![Self::Agy]),
+            // OpenCodeGo is deliberately absent from the opencode card: the
+            // user removed quota rows from opencode pane cards, so the Go
+            // collector feeds only the status strip and dashboard.
+            "opencode" => Some(vec![Self::Codex, Self::Grok]),
+            "opencode-go" | "go" => Some(vec![Self::OpenCodeGo]),
+            "deepseek" | "deepseek-api" => Some(vec![Self::DeepSeek]),
+            "zcode" | "zcode-glm" | "glm" => Some(vec![Self::ZcodeGlm]),
+            _ => None,
         }
     }
 }
@@ -58,12 +124,13 @@ impl std::str::FromStr for Provider {
     type Err = ModelError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "codex" => Ok(Self::Codex),
-            "grok" => Ok(Self::Grok),
-            "claude" | "claude-code" | "anthropic" => Ok(Self::Claude),
-            "agy" | "antigravity" | "antigravity-cli" => Ok(Self::Agy),
-            other => Err(ModelError::UnknownProvider(other.to_string())),
+        // Only 1:1 kinds name a single provider identity; multi-provider
+        // kinds (opencode) deliberately fail to parse as a lone Provider.
+        match Self::providers_for_agent(value).as_deref() {
+            Some([provider]) => Ok(*provider),
+            _ => Err(ModelError::UnknownProvider(
+                value.trim().to_ascii_lowercase(),
+            )),
         }
     }
 }
@@ -73,6 +140,7 @@ impl std::str::FromStr for Provider {
 pub enum WindowKind {
     FiveHour,
     Weekly,
+    Monthly,
 }
 
 impl WindowKind {
@@ -80,6 +148,7 @@ impl WindowKind {
         match self {
             Self::FiveHour => "5h",
             Self::Weekly => "week",
+            Self::Monthly => "month",
         }
     }
 
@@ -87,6 +156,9 @@ impl WindowKind {
         match self {
             Self::FiveHour => 5 * 60 * 60,
             Self::Weekly => 7 * 24 * 60 * 60,
+            // A nominal 30-day month; severity only compares this against the
+            // time left before reset, so an approximation is enough.
+            Self::Monthly => 30 * 24 * 60 * 60,
         }
     }
 }
@@ -332,6 +404,8 @@ pub struct ProviderSnapshot {
     pub windows: Vec<UsageWindow>,
     #[serde(default)]
     pub context: Option<ContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<AccountBalance>,
     #[serde(default)]
     pub session_summaries: BTreeMap<String, String>,
     /// Login identity the snapshot was fetched for (Grok `user_id`, Codex
@@ -350,6 +424,7 @@ impl ProviderSnapshot {
             fetched_at_unix,
             windows,
             context: None,
+            balance: None,
             session_summaries: BTreeMap::new(),
             account_id: None,
         }
@@ -357,6 +432,11 @@ impl ProviderSnapshot {
 
     pub fn with_context(mut self, context: Option<ContextUsage>) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn with_balance(mut self, balance: Option<AccountBalance>) -> Self {
+        self.balance = balance;
         self
     }
 
@@ -391,17 +471,50 @@ impl ProviderSnapshot {
         self.windows.iter().find(|window| window.kind == kind)
     }
 
+    /// The window closest to exhaustion, so a multi-window provider shows
+    /// whichever limit will bite first.
+    pub fn most_consumed_window(&self) -> Option<&UsageWindow> {
+        self.windows.iter().min_by(|left, right| {
+            left.remaining_percent
+                .partial_cmp(&right.remaining_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
     pub fn severity(&self, now_unix: u64) -> Severity {
         let relevant = match self.provider {
             Provider::Grok => self.window(WindowKind::Weekly),
             Provider::Codex | Provider::Claude | Provider::Agy => self
                 .window(WindowKind::FiveHour)
                 .or_else(|| self.window(WindowKind::Weekly)),
+            // Go and GLM report independent windows; the binding one is the
+            // closest to exhaustion.
+            Provider::OpenCodeGo | Provider::ZcodeGlm => self.most_consumed_window(),
+            Provider::DeepSeek => {
+                return self
+                    .balance
+                    .as_ref()
+                    .map(|balance| {
+                        if balance.is_available {
+                            Severity::Normal
+                        } else {
+                            Severity::Danger
+                        }
+                    })
+                    .unwrap_or(Severity::Unknown);
+            }
         };
         relevant
             .map(|window| Severity::for_window(window, now_unix))
             .unwrap_or(Severity::Unknown)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountBalance {
+    pub currency: String,
+    pub total_balance: String,
+    pub is_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,5 +740,69 @@ mod tests {
         assert_eq!(Provider::Grok.badge(), "[X]");
         assert_eq!(Provider::Codex.icon(), "◈C");
         assert_eq!(Provider::Claude.icon(), "✦Cl");
+    }
+
+    #[test]
+    fn opencode_maps_to_codex_and_grok_subscription_quota() {
+        let mapping = Provider::providers_for_agent("opencode");
+        assert_eq!(mapping, Some(vec![Provider::Codex, Provider::Grok]));
+        // OpenCodeGo is status/dashboard-only by design; the pane card keeps
+        // its original two subscriptions.
+        assert!(mapping.is_none_or(|providers| !providers.contains(&Provider::OpenCodeGo)));
+        assert_eq!(
+            Provider::providers_for_agent("  OpenCode\t"),
+            Some(vec![Provider::Codex, Provider::Grok])
+        );
+    }
+
+    #[test]
+    fn opencode_go_parses_from_canonical_name_and_go_alias() {
+        assert_eq!(
+            "opencode-go".parse::<Provider>().unwrap(),
+            Provider::OpenCodeGo
+        );
+        assert_eq!("go".parse::<Provider>().unwrap(), Provider::OpenCodeGo);
+        assert_eq!("GO".parse::<Provider>().unwrap(), Provider::OpenCodeGo);
+    }
+
+    #[test]
+    fn every_provider_is_reachable_from_the_all_list() {
+        for provider in Provider::ALL {
+            assert_eq!(
+                provider.agent_kind().parse::<Provider>().unwrap(),
+                provider,
+                "agent_kind() must round-trip through FromStr"
+            );
+        }
+    }
+
+    #[test]
+    fn one_to_one_agent_kinds_keep_their_single_provider() {
+        assert_eq!(
+            Provider::providers_for_agent("claude"),
+            Some(vec![Provider::Claude])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("claude-code"),
+            Some(vec![Provider::Claude])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("ANTIGRAVITY-CLI"),
+            Some(vec![Provider::Agy])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("codex"),
+            Some(vec![Provider::Codex])
+        );
+        assert_eq!(
+            Provider::providers_for_agent("grok"),
+            Some(vec![Provider::Grok])
+        );
+        assert_eq!(Provider::providers_for_agent("gemini"), None);
+    }
+
+    #[test]
+    fn multi_provider_kinds_have_no_single_provider_identity() {
+        assert!("opencode".parse::<Provider>().is_err());
     }
 }

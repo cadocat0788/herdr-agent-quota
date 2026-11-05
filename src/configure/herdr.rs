@@ -39,11 +39,15 @@ const QUOTA_DANGER_COLOR: &str = "#ca6470";
 const CONTEXT_COLOR: &str = "#9b8fd8";
 const CACHE_COLOR: &str = "#6fb5b7";
 const CACHE_TTL_COLOR: &str = "#cdaa65";
-const PROVIDER_STYLES: [(&str, Option<&str>); 4] = [
+// `opencode` is a pane kind, not a data source, and deliberately gets no new
+// metadata token names: its card reuses the existing $quota_* slots, which
+// keeps the token diff-gate in src/herdr.rs untouched.
+const PROVIDER_STYLES: [(&str, Option<&str>); 5] = [
     ("claude", Some("#c47f6a")),
     ("codex", Some("#7998b7")),
     ("grok", Some("#acb4c3")),
     ("agy", Some("#84b0af")),
+    ("opencode", Some("#7a9e7e")),
 ];
 
 pub fn check() -> Result<()> {

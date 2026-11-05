@@ -17,15 +17,19 @@ pub struct MetadataTokens {
     pub quota_cache: String,
     pub quota_cache_ttl: String,
     pub quota_error: Option<String>,
+    // Overall snapshot severity, so a pane fed by several providers can pick
+    // which one owns its shared identity slots.
+    pub severity: Severity,
 }
 
 impl MetadataTokens {
     pub fn from_snapshot(snapshot: &ProviderSnapshot, now_unix: u64) -> Self {
+        let severity = snapshot.severity(now_unix);
         Self {
-            quota_state: snapshot.severity(now_unix).symbol().to_string(),
+            quota_state: severity.symbol().to_string(),
             quota_icon: snapshot.provider.icon().to_string(),
             quota_provider: snapshot.provider.display_name().to_string(),
-            quota_status: snapshot.severity(now_unix).label().to_string(),
+            quota_status: severity.label().to_string(),
             quota_5h: sidebar_window(snapshot, WindowKind::FiveHour, now_unix),
             quota_5h_severity: window_severity(snapshot, WindowKind::FiveHour, now_unix),
             quota_week: sidebar_window(snapshot, WindowKind::Weekly, now_unix),
@@ -35,6 +39,7 @@ impl MetadataTokens {
             quota_cache: sidebar_cache(snapshot),
             quota_cache_ttl: sidebar_cache_ttl(snapshot, now_unix),
             quota_error: sidebar_cache_error(snapshot, now_unix),
+            severity,
         }
     }
 
@@ -45,20 +50,27 @@ impl MetadataTokens {
             quota_provider: provider.display_name().to_string(),
             quota_status: Severity::Unknown.label().to_string(),
             quota_5h: match provider {
-                Provider::Claude | Provider::Agy => "5h N/A".to_string(),
-                Provider::Codex | Provider::Grok => String::new(),
+                Provider::Claude | Provider::Agy | Provider::OpenCodeGo | Provider::ZcodeGlm => "5h N/A".to_string(),
+                Provider::Codex | Provider::Grok | Provider::DeepSeek => String::new(),
             },
             quota_5h_severity: match provider {
-                Provider::Claude | Provider::Agy => Some(Severity::Unknown),
-                Provider::Codex | Provider::Grok => None,
+                Provider::Claude | Provider::Agy | Provider::OpenCodeGo | Provider::ZcodeGlm => Some(Severity::Unknown),
+                Provider::Codex | Provider::Grok | Provider::DeepSeek => None,
             },
-            quota_week: "7d N/A".to_string(),
-            quota_week_severity: Some(Severity::Unknown),
+            quota_week: match provider {
+                Provider::DeepSeek => String::new(),
+                _ => "7d N/A".to_string(),
+            },
+            quota_week_severity: match provider {
+                Provider::DeepSeek => None,
+                _ => Some(Severity::Unknown),
+            },
             quota_summary: "unavailable".to_string(),
             quota_context: String::new(),
             quota_cache: String::new(),
             quota_cache_ttl: String::new(),
             quota_error: Some(reason.into().chars().take(80).collect()),
+            severity: Severity::Unknown,
         }
     }
 }
@@ -81,13 +93,27 @@ pub fn dashboard_summary(snapshot: &ProviderSnapshot, now_unix: u64) -> String {
     summary(snapshot, now_unix, true)
 }
 
+pub fn balance_summary(snapshot: &ProviderSnapshot) -> Option<String> {
+    snapshot
+        .balance
+        .as_ref()
+        .map(|balance| format!("{} {}", balance.total_balance, balance.currency))
+}
+
 fn summary(snapshot: &ProviderSnapshot, now_unix: u64, include_left: bool) -> String {
-    [WindowKind::FiveHour, WindowKind::Weekly]
-        .into_iter()
-        .filter_map(|kind| snapshot.window(kind))
-        .map(|window| format_window(window, now_unix, include_left))
-        .collect::<Vec<_>>()
-        .join(" · ")
+    if let Some(balance) = balance_summary(snapshot) {
+        return balance;
+    }
+    [
+        WindowKind::FiveHour,
+        WindowKind::Weekly,
+        WindowKind::Monthly,
+    ]
+    .into_iter()
+    .filter_map(|kind| snapshot.window(kind))
+    .map(|window| format_window(window, now_unix, include_left))
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn sidebar_window(snapshot: &ProviderSnapshot, kind: WindowKind, now_unix: u64) -> String {
@@ -162,6 +188,7 @@ fn format_compact_window(window: &UsageWindow, now_unix: u64) -> String {
     let label = match window.kind {
         WindowKind::FiveHour => "5h",
         WindowKind::Weekly => "7d",
+        WindowKind::Monthly => "month",
     };
     let percent = format!("{}%", format_percent(window.remaining_percent));
     let Some(reset) = window.resets_at else {
@@ -170,7 +197,7 @@ fn format_compact_window(window: &UsageWindow, now_unix: u64) -> String {
     format!("{label} {percent} {}", format_reset_eta(reset, now_unix))
 }
 
-fn format_reset_eta(reset_at: ResetAt, now_unix: u64) -> String {
+pub fn format_reset_eta(reset_at: ResetAt, now_unix: u64) -> String {
     let seconds = reset_at.unix_seconds().saturating_sub(now_unix);
     if seconds == 0 {
         return "due".to_string();
@@ -254,6 +281,27 @@ mod tests {
         let weekly = format_window(&window(WindowKind::Weekly, 75.0, 183_600), 0, false);
         assert_eq!(five_hour, "5h 43% reset 4h07m");
         assert_eq!(weekly, "week 25% reset 2d3h");
+    }
+
+    #[test]
+    fn opencode_go_windows_render_including_the_month_label() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::OpenCodeGo,
+            vec![
+                window(WindowKind::FiveHour, 0.0, 14_820),
+                window(WindowKind::Weekly, 0.0, 183_600),
+                window(WindowKind::Monthly, 72.0, 400_000),
+            ],
+            0,
+        );
+        assert_eq!(
+            sidebar_summary(&snapshot, 0),
+            "5h 100% reset 4h07m · week 100% reset 2d3h · month 28% reset 4d15h"
+        );
+        assert_eq!(
+            dashboard_summary(&snapshot, 0),
+            "5h 100% left reset 4h07m · week 100% left reset 2d3h · month 28% left reset 4d15h"
+        );
     }
 
     #[test]

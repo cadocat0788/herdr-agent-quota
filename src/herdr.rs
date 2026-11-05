@@ -31,7 +31,7 @@ const LEGACY_METADATA_TOKEN_NAMES: [&str; 2] = ["quota_badge", "quota_session"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
     pub pane_id: String,
-    pub provider: Provider,
+    pub providers: Vec<Provider>,
     pub session_id: Option<String>,
     pub session_summary: String,
     pub topic: String,
@@ -85,10 +85,10 @@ fn list_agent_value() -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("parse Herdr agent list")
 }
 
-pub fn current_agent_provider() -> Result<Option<Provider>> {
+pub fn current_agent_providers() -> Result<Vec<Provider>> {
     if let Some(agent) = std::env::var_os("HERDR_FOCUSED_PANE_AGENT") {
-        if let Ok(provider) = agent.to_string_lossy().parse::<Provider>() {
-            return Ok(Some(provider));
+        if let Some(providers) = Provider::providers_for_agent(&agent.to_string_lossy()) {
+            return Ok(providers);
         }
     }
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
@@ -104,15 +104,23 @@ pub fn current_agent_provider() -> Result<Option<Provider>> {
     Ok(value
         .pointer("/result/pane/agent")
         .and_then(Value::as_str)
-        .and_then(|agent| agent.parse::<Provider>().ok()))
+        .and_then(Provider::providers_for_agent)
+        .unwrap_or_default())
 }
 
 // Reading a pane makes Herdr repaint it, which visibly scrolls the agent's
 // terminal. Only the pane that fired the event is worth that cost; every other
 // pane keeps the topic it last published.
 pub fn refresh_pane_topic(pane: &mut AgentPane) {
+    // Multi-agent cards (opencode) interleave several agents' prompt styles,
+    // so marker matching cannot tell which line is the user's prompt yet.
+    // Reading would repaint the pane and still find nothing; marker tuning is
+    // deferred until it can be verified against a live pane.
+    let [provider] = pane.providers.as_slice() else {
+        return;
+    };
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    if let Some(topic) = read_pane_topic(&executable, pane) {
+    if let Some(topic) = read_pane_topic(&executable, pane, provider) {
         pane.topic = topic;
     }
 }
@@ -135,7 +143,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .and_then(Value::as_str)
                 });
             if let (Some(pane_id), Some(kind)) = (pane_id, kind) {
-                if let Ok(provider) = kind.parse::<Provider>() {
+                if let Some(providers) = Provider::providers_for_agent(kind) {
                     let tokens: BTreeMap<String, String> = map
                         .get("tokens")
                         .and_then(Value::as_object)
@@ -157,7 +165,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .map(str::to_string);
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
-                        provider,
+                        providers,
                         session_id,
                         session_summary,
                         // Preserve the last published topic during quota-only
@@ -240,14 +248,24 @@ pub fn publish_tokens(
     let mut reported = 0usize;
     let mut failed = Vec::new();
     for pane in panes {
-        let Some((_, values)) = tokens
+        // A pane is served when any of its identities has usable data.
+        // Single-provider panes resolve exactly as before; multi-agent cards
+        // (opencode) combine their providers' windows onto one card.
+        let supported: Vec<&(Provider, MetadataTokens)> = pane
+            .providers
             .iter()
-            .find(|(provider, _)| *provider == pane.provider)
-        else {
+            .filter_map(|provider| tokens.iter().find(|(candidate, _)| candidate == provider))
+            .collect();
+        if supported.is_empty() {
             continue;
-        };
+        }
         let topic = display_topic(pane);
-        let desired = desired_tokens(values, &topic);
+        let desired = if pane.providers.len() > 1 {
+            desired_multi_provider_tokens(&pane.providers, tokens, &topic)
+        } else {
+            let (_, values) = supported[0];
+            desired_tokens(values, &topic)
+        };
         if metadata_matches(&pane.tokens, &desired) {
             continue;
         }
@@ -341,6 +359,75 @@ fn desired_tokens(values: &MetadataTokens, topic: &str) -> BTreeMap<String, Stri
         tokens.insert("quota_error".to_string(), error.clone());
     }
     tokens
+}
+
+// A multi-agent card (opencode) shows two independent subscriptions on one
+// pane. Their weekly windows are placed into Herdr's two window groups
+// without introducing token names: Codex fills $quota_week_* and Grok fills
+// $quota_5h_*, which stays absent for every single-provider pane today. Zero
+// schema changes, each group keeps its own severity coloring, and Herdr
+// elides absent groups when only one subscription has data. Each value is
+// prefixed with its provider's lowercase kind name so the two rows stay
+// distinguishable; single-provider panes never see these slots.
+fn desired_multi_provider_tokens(
+    providers: &[Provider],
+    tokens: &[(Provider, MetadataTokens)],
+    topic: &str,
+) -> BTreeMap<String, String> {
+    let mut desired = BTreeMap::new();
+
+    // Shared identity slots follow the worst severity; equal severities keep
+    // the earlier provider, and providers_for_agent lists Codex before Grok.
+    let mut identity: Option<(u8, &MetadataTokens)> = None;
+    for provider in providers {
+        let Some((_, values)) = tokens.iter().find(|(candidate, _)| candidate == provider) else {
+            continue;
+        };
+        let rank = severity_rank(values.severity);
+        if identity.is_none_or(|(best, _)| rank > best) {
+            identity = Some((rank, values));
+        }
+    }
+    if let Some((_, values)) = identity {
+        for (name, value) in [
+            ("quota_state", &values.quota_state),
+            ("quota_provider", &values.quota_provider),
+            ("quota_summary", &values.quota_summary),
+        ] {
+            desired.insert(name.to_string(), value.clone());
+        }
+        if let Some(error) = &values.quota_error {
+            desired.insert("quota_error".to_string(), error.clone());
+        }
+    }
+
+    for (provider, base) in [
+        (Provider::Codex, "quota_week"),
+        (Provider::Grok, "quota_5h"),
+    ] {
+        let Some((_, values)) = tokens.iter().find(|(candidate, _)| *candidate == provider) else {
+            continue;
+        };
+        if values.quota_week.trim().is_empty() {
+            continue;
+        }
+        // The prefix rides inside whichever severity variant gets selected.
+        let value = format!("{} {}", provider.agent_kind(), values.quota_week);
+        insert_optional_token(&mut desired, base, &value);
+        insert_severity_token(&mut desired, base, &value, values.quota_week_severity);
+    }
+
+    insert_optional_token(&mut desired, "quota_topic", topic);
+    desired
+}
+
+fn severity_rank(severity: crate::model::Severity) -> u8 {
+    match severity {
+        crate::model::Severity::Danger => 3,
+        crate::model::Severity::Warning => 2,
+        crate::model::Severity::Normal => 1,
+        crate::model::Severity::Unknown => 0,
+    }
 }
 
 fn display_topic(pane: &AgentPane) -> String {
@@ -462,7 +549,11 @@ fn topic_read_args(pane_id: &str) -> [&str; 7] {
     ]
 }
 
-fn read_pane_topic(executable: &std::ffi::OsStr, pane: &AgentPane) -> Option<String> {
+fn read_pane_topic(
+    executable: &std::ffi::OsStr,
+    pane: &AgentPane,
+    provider: &Provider,
+) -> Option<String> {
     let output = Command::new(executable)
         .args(topic_read_args(&pane.pane_id))
         .output()
@@ -471,7 +562,7 @@ fn read_pane_topic(executable: &std::ffi::OsStr, pane: &AgentPane) -> Option<Str
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    extract_topic(&text, pane.provider)
+    extract_topic(&text, *provider)
 }
 
 fn extract_topic(text: &str, provider: Provider) -> Option<String> {
@@ -551,7 +642,7 @@ mod tests {
             vec![
                 AgentPane {
                     pane_id: "w1:p1".to_string(),
-                    provider: Provider::Codex,
+                    providers: vec![Provider::Codex],
                     session_id: None,
                     session_summary: String::new(),
                     topic: String::new(),
@@ -559,7 +650,7 @@ mod tests {
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
-                    provider: Provider::Claude,
+                    providers: vec![Provider::Claude],
                     session_id: None,
                     session_summary: String::new(),
                     topic: String::new(),
@@ -582,6 +673,19 @@ mod tests {
     }
 
     #[test]
+    fn opencode_panes_collect_both_subscription_providers() {
+        let value = json!({"result": {"agents": [
+            {"pane_id": "w1:p9", "agent": "opencode"},
+            {"pane_id": "w1:p1", "agent": "codex"}
+        ]}});
+        let mut panes = Vec::new();
+        collect_agent_panes(&value, &mut panes);
+        panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+        assert_eq!(panes[0].providers, vec![Provider::Codex]);
+        assert_eq!(panes[1].providers, vec![Provider::Codex, Provider::Grok]);
+    }
+
+    #[test]
     fn discovers_codex_session_id_and_preserves_session_summary() {
         let value = json!({"result": {"agents": [{
             "pane_id": "w1:p1",
@@ -599,7 +703,7 @@ mod tests {
     fn legacy_metadata_tokens_force_one_bounded_cleanup_report() {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
-            provider: Provider::Claude,
+            providers: vec![Provider::Claude],
             session_id: None,
             session_summary: String::new(),
             topic: String::new(),
@@ -641,7 +745,7 @@ mod tests {
         let desired = desired_tokens(&MetadataTokens::from_snapshot(&snapshot, 0), "prompt");
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
-            provider: Provider::Claude,
+            providers: vec![Provider::Claude],
             session_id: None,
             session_summary: String::new(),
             topic: String::new(),
@@ -687,7 +791,7 @@ mod tests {
         tokens.insert("quota_session".to_string(), "old".to_string());
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
-            provider: Provider::Claude,
+            providers: vec![Provider::Claude],
             session_id: None,
             session_summary: String::new(),
             topic: String::new(),
@@ -795,5 +899,133 @@ mod tests {
         let topic = truncate_topic(&"你好".repeat(50));
         assert!(topic.ends_with('…'));
         assert!(topic.chars().count() <= 78);
+    }
+
+    fn weekly_tokens(
+        provider: Provider,
+        used_percent: f64,
+        reset_in_seconds: u64,
+    ) -> MetadataTokens {
+        let now = 1_000_000;
+        let snapshot = crate::model::ProviderSnapshot::new(
+            provider,
+            vec![crate::model::UsageWindow::new(
+                crate::model::WindowKind::Weekly,
+                used_percent,
+                Some(crate::model::ResetAt::after(now, reset_in_seconds)),
+            )
+            .unwrap()],
+            now,
+        );
+        MetadataTokens::from_snapshot(&snapshot, now)
+    }
+
+    // Codex and Grok only ever carry a weekly window, so an opencode card
+    // reuses the always-absent $quota_5h_* slots for Grok's week while Codex
+    // keeps $quota_week_*. Severities are computed per provider, and each
+    // value carries its provider's lowercase kind name so the rows read
+    // unambiguously on the shared card.
+    #[test]
+    fn opencode_cards_place_each_subscription_week_in_distinct_groups() {
+        let providers = Provider::providers_for_agent("opencode").unwrap();
+        let tokens = vec![
+            (
+                Provider::Codex,
+                weekly_tokens(Provider::Codex, 25.0, 1_209_600),
+            ),
+            (Provider::Grok, weekly_tokens(Provider::Grok, 60.0, 60_480)),
+        ];
+        let desired = desired_multi_provider_tokens(&providers, &tokens, "");
+        assert_eq!(
+            desired.get("quota_week").map(String::as_str),
+            Some("codex week 75% reset 14d0h")
+        );
+        assert_eq!(
+            desired.get("quota_week_warning").map(String::as_str),
+            Some("codex week 75% reset 14d0h")
+        );
+        assert!(!desired.contains_key("quota_week_normal"));
+        assert!(!desired.contains_key("quota_week_danger"));
+        assert_eq!(
+            desired.get("quota_5h").map(String::as_str),
+            Some("grok week 40% reset 16h48m")
+        );
+        assert_eq!(
+            desired.get("quota_5h_normal").map(String::as_str),
+            Some("grok week 40% reset 16h48m")
+        );
+        assert!(!desired.contains_key("quota_5h_warning"));
+        assert!(!desired.contains_key("quota_5h_danger"));
+    }
+
+    #[test]
+    fn opencode_identity_slots_follow_worst_severity_and_prefer_codex_on_ties() {
+        let providers = Provider::providers_for_agent("opencode").unwrap();
+
+        // Equal severities keep Codex, the first provider for the card.
+        let tokens = vec![
+            (
+                Provider::Codex,
+                weekly_tokens(Provider::Codex, 85.0, 60_480),
+            ),
+            (Provider::Grok, weekly_tokens(Provider::Grok, 60.0, 60_480)),
+        ];
+        let desired = desired_multi_provider_tokens(&providers, &tokens, "");
+        assert_eq!(
+            desired.get("quota_provider").map(String::as_str),
+            Some("Codex")
+        );
+        assert_eq!(desired.get("quota_state").map(String::as_str), Some("●"));
+        assert!(!desired.contains_key("quota_badge"));
+        assert!(!desired.contains_key("quota_status"));
+
+        // A worse severity on Grok takes the identity slots over.
+        let tokens = vec![
+            (
+                Provider::Codex,
+                weekly_tokens(Provider::Codex, 85.0, 60_480),
+            ),
+            (
+                Provider::Grok,
+                weekly_tokens(Provider::Grok, 95.0, 1_209_600),
+            ),
+        ];
+        let desired = desired_multi_provider_tokens(&providers, &tokens, "");
+        assert_eq!(
+            desired.get("quota_provider").map(String::as_str),
+            Some("Grok")
+        );
+        assert_eq!(desired.get("quota_state").map(String::as_str), Some("!"));
+        assert!(!desired.contains_key("quota_badge"));
+        assert!(!desired.contains_key("quota_status"));
+
+        // With no Grok data at all the card still renders Codex alone.
+        let codex_only = vec![(
+            Provider::Codex,
+            weekly_tokens(Provider::Codex, 85.0, 60_480),
+        )];
+        let desired = desired_multi_provider_tokens(&providers, &codex_only, "topic");
+        assert_eq!(
+            desired.get("quota_provider").map(String::as_str),
+            Some("Codex")
+        );
+        assert!(desired.contains_key("quota_week_normal"));
+        assert!(!desired.contains_key("quota_5h"));
+    }
+
+    // Regression guard: values on single-provider panes stay bare; only the
+    // merged-card composer adds the provider kind prefix.
+    #[test]
+    fn single_provider_windows_stay_unprefixed() {
+        let desired = desired_tokens(&weekly_tokens(Provider::Codex, 25.0, 1_209_600), "");
+        assert_eq!(
+            desired.get("quota_week").map(String::as_str),
+            Some("week 75% reset 14d0h")
+        );
+        assert_eq!(
+            desired.get("quota_week_warning").map(String::as_str),
+            Some("week 75% reset 14d0h")
+        );
+        assert!(!desired.contains_key("quota_5h"));
     }
 }

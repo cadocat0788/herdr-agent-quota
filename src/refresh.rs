@@ -1,12 +1,12 @@
 use crate::cache::CacheStore;
 use crate::herdr::{
-    current_agent_provider, list_agent_panes, list_agent_state, publish_tokens, refresh_pane_topic,
-    AgentPane,
+    current_agent_providers, list_agent_panes, list_agent_state, publish_tokens,
+    refresh_pane_topic, AgentPane,
 };
 use crate::model::{Provider, ProviderSnapshot};
 use crate::presentation::MetadataTokens;
 use crate::providers::statusline::enrich_cache_session;
-use crate::providers::{codex, grok};
+use crate::providers::{codex, deepseek, grok, opencode_go, zcode_glm};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -127,11 +127,12 @@ fn run_internal(
 
 pub fn event() -> Result<()> {
     let event = event_json();
+    // Unknown agent kinds keep the historical fallback of refreshing every
+    // provider; multi-agent kinds (opencode) refresh all of their sources.
     let providers = event
         .as_ref()
         .and_then(find_agent)
-        .and_then(|agent| agent.parse::<Provider>().ok())
-        .map(|provider| vec![provider])
+        .and_then(Provider::providers_for_agent)
         .unwrap_or_else(|| Provider::ALL.to_vec());
     let topic_pane = event.as_ref().and_then(find_pane_id);
     let status = event.as_ref().and_then(find_status);
@@ -150,10 +151,20 @@ pub fn event() -> Result<()> {
 }
 
 pub fn focus() -> Result<()> {
-    let Some(provider) = current_agent_provider()? else {
+    let providers = current_agent_providers()?;
+    if providers.is_empty() {
         return Ok(());
-    };
-    run(&[provider], false, false)
+    }
+    run(&providers, false, false)
+}
+
+/// Refresh one provider under the state-dir locking rules with the standard
+/// 60s debounce, skipping pane publication entirely. The status poll uses this
+/// so the Go collector gets refreshed without ever touching a pane.
+pub fn debounced_refresh(provider: Provider) -> Result<()> {
+    let cache = CacheStore::from_env()?;
+    refresh_selected(&cache, &[provider], false)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -211,6 +222,9 @@ fn refresh_provider(
     let fetched = match provider {
         Provider::Codex => codex::fetch().map(FetchedSnapshot::direct),
         Provider::Grok => grok::fetch().map(FetchedSnapshot::direct),
+        Provider::OpenCodeGo => opencode_go::fetch().map(FetchedSnapshot::direct),
+        Provider::DeepSeek => deepseek::fetch().map(FetchedSnapshot::direct),
+        Provider::ZcodeGlm => zcode_glm::fetch().map(FetchedSnapshot::direct),
         Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
     };
     cache.mark_refresh(provider, now)?;
@@ -285,6 +299,9 @@ fn current_account_gate(provider: Provider) -> (Option<String>, Option<u64>) {
             (account_id, mtime)
         }
         Provider::Codex => (codex::current_account_id(), codex::auth_mtime_unix()),
+        // OpenCodeGo's auth file has no stable account id to gate on yet; its
+        // snapshot stays usable across key rotations like Claude/Agy.
+        Provider::OpenCodeGo | Provider::DeepSeek | Provider::ZcodeGlm => (None, None),
         Provider::Claude | Provider::Agy => (None, None),
     }
 }
@@ -330,9 +347,13 @@ fn publish(
         |panes| panes.to_vec(),
     );
     if let Some(pane) = topic_pane.and_then(|pane_id| {
-        panes
-            .iter_mut()
-            .find(|pane| pane.pane_id == pane_id && providers.contains(&pane.provider))
+        panes.iter_mut().find(|pane| {
+            pane.pane_id == pane_id
+                && pane
+                    .providers
+                    .iter()
+                    .any(|provider| providers.contains(provider))
+        })
     }) {
         refresh_pane_topic(pane);
     }
@@ -345,7 +366,10 @@ fn publish(
             .as_ref()
             .filter(|snapshot| snapshot.usable_for_account(account_id.as_deref(), mtime));
         if let Some(snapshot) = usable {
-            for pane in panes.iter_mut().filter(|pane| pane.provider == *provider) {
+            for pane in panes
+                .iter_mut()
+                .filter(|pane| pane.providers.contains(provider))
+            {
                 if let Some(session_id) = pane.session_id.as_deref() {
                     if let Some(summary) = snapshot.session_summaries.get(session_id) {
                         pane.session_summary = summary.clone();

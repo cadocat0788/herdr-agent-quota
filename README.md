@@ -172,14 +172,66 @@ Claude and Agy statusLine commands. Older plugin-owned Grok response hooks are
 removed during configure; the single global watcher now covers Grok as well, so
 long turns no longer start one refresh command per tool call.
 
-## Supported providers
+## Optional: global status strip and quota dashboard
+
+The sidebar cards are per-pane. Two global surfaces are available but **not**
+enabled by the installer, because they touch `[ui]` and keybindings that belong
+to the user:
+
+1. **Status strip** (tab bar, bottom): one line summarizing every subscription,
+   rendered by the `status` subcommand.
+2. **Quota dashboard popup**: the `dashboard` subcommand in a popup; the usual
+   binding is `prefix+u`.
+
+To enable both, add to `~/.config/herdr/config.toml` (adjust the binary path to
+your checkout):
+
+```toml
+[ui]
+tab_bar_position = "bottom"
+tab_bar_right = [
+  { type = "command", command = "HERDR_PLUGIN_STATE_DIR='<plugin-state-dir>' /path/to/herdr-agent-quota/target/release/herdr-agent-quota status", interval_seconds = 30, timeout_seconds = 5 },
+]
+
+[[keys.command]]
+key = "prefix+u"
+type = "popup"
+command = "HERDR_PLUGIN_STATE_DIR='<plugin-state-dir>' /path/to/herdr-agent-quota/target/release/herdr-agent-quota dashboard"
+description = "quota dashboard"
+width = "60%"
+height = "60%"
+```
+
+`<plugin-state-dir>` is Herdr's plugin state directory for this plugin
+(`~/.local/state/herdr/plugins/herdr-agent-quota` by default on Linux); the
+custom keybinding command does not receive `HERDR_PLUGIN_STATE_DIR`
+automatically, so it must be set explicitly in the command string. Reload with
+`herdr server reload-config`.
+
+Strip layout notes: the tab bar shows only the last output line and clips it on
+narrow terminals, so the strip prints one compact segment per provider with `→`
+before each reset ETA. Codex, OpenCode Go, and Zcode GLM track their rolling ~5h
+window; GLM's weekly window and Grok are dashboard-popup detail. DeepSeek shows
+its raw balance (`DSk`). `status` is cache-first and fails silent: a provider
+without credentials or a usable snapshot simply has no segment, and an empty
+cache renders an empty line.
+
+The dashboard popup iterates every provider (including Grok) with all their
+windows; press `r` inside to force-refresh, `q`/`Esc` to close.
+
+## Supported CLIs
 
 | Provider | Sidebar windows | Local collection path | Extra setup |
 | --- | --- | --- | --- |
-| Claude Code | `5h` + `7d` + context + cache hit/approx. TTL | Official `statusLine` JSON: `rate_limits`, `context_window`, and `transcript_path` | The configure action installs/chains it and keeps its refresh interval current |
-| OpenAI Codex | `5h` + `7d` + local session summary | One-shot local `codex app-server --stdio`: quota and bounded `thread/list` | ChatGPT subscription login; API-key mode is shown as unavailable |
-| Grok CLI / Grok Build | `week` | Local `~/.grok/auth.json` and the billing contract used by the official CLI | Covered by the unified watcher; no response hook is installed |
-| Agy / Antigravity CLI | `5h` + `week` + context + cache hit | Official `statusLine` JSON: `quota` and `context_window` | The configure action installs and chains it automatically |
+| Claude Code `2.1.233` | `5h` + `7d` + context + cache hit/approx. TTL | Official `statusLine` JSON: `rate_limits`, `context_window`, and `transcript_path` | The configure action installs/chains it and keeps its refresh interval current |
+| OpenAI Codex `0.147.0` | `5h` + `7d` + local session summary | One-shot local `codex app-server --stdio`: quota and bounded `thread/list` | ChatGPT subscription login; API-key mode is shown as unavailable |
+| Grok CLI / Grok Build `1.0.4` | `week` | Local `~/.grok/auth.json` and the billing contract used by the official CLI | Covered by the unified watcher; no response hook is installed |
+| Zcode GLM coding plan | `5h` + `week` | `api.z.ai/api/monitor/usage/quota/limit` with the key from Pi's auth store (`zai-coding-cn` entry in `~/.pi/agent/auth.json`) | Needs that key file; set `ZCODE_GLM_AUTH_FILE` to point elsewhere |
+| Agy / Antigravity CLI `1.1.13` | `5h` + `week` + context + cache hit | Official `statusLine` JSON: `quota` and `context_window` | The configure action installs and chains it automatically |
+
+Versions above were checked on the development machine on 2026-08-15. The
+parser follows the provider fields rather than hard-coding these version
+strings, so newer compatible CLI releases can continue to work.
 
 The sidebar shows **percentage remaining** and the time until each quota reset,
 not quota token counts. The two Claude windows use compact `5h` and `7d`
